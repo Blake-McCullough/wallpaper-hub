@@ -35,7 +35,7 @@ CFG_FILE = CFG_DIR / "config.json"
 PID_FILE = DATA_DIR / "engine.pid"
 LOG_FILE = DATA_DIR / "engine.log"
 AUTOSTART = Path.home() / ".config/autostart/wallpaper-hub.desktop"
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 PLUGIN_ID = "com.github.catsout.wallpaperEngineKde"   # Wallpaper Engine for KDE (Plasma wallpaper plugin)
 REPO = "Blake-McCullough/wallpaper-hub"
 SCRIPT = Path(os.path.realpath(__file__))
@@ -587,14 +587,37 @@ def kde_apply_plugin(wdir, geo=None, scaling="default"):
                        "Install it with:  paru -S wallpaper-engine-kde-plugin-git\n"
                        "then restart Plasma (log out and in).")
     cond = "true" if not geo else "(g.x==%d&&g.y==%d&&g.width==%d&&g.height==%d)" % tuple(geo)
-    fill = {"stretch": 0, "fit": 1, "fill": 2}.get(scaling)        # Qt Image fillMode values
+    src, lib, wid = plugin_values(wdir)
     js = ("var found=false;var ds=desktops();for(var i=0;i<ds.length;i++){var d=ds[i];var g=screenGeometry(d.screen);"
           "if(" + cond + "){d.wallpaperPlugin=" + json.dumps(PLUGIN_ID) + ";"
           "d.currentConfigGroup=[\"Wallpaper\"," + json.dumps(PLUGIN_ID) + ",\"General\"];"
-          "d.writeConfig(\"WallpaperSource\"," + json.dumps(wdir) + ");"
-          + ("d.writeConfig(\"FillMode\"," + str(fill) + ");" if fill is not None else "") +
+          "d.writeConfig(\"SteamLibraryPath\"," + json.dumps(lib) + ");"
+          "d.writeConfig(\"WallpaperSource\"," + json.dumps(src) + ");"
+          "d.writeConfig(\"WallpaperWorkShopId\"," + json.dumps(wid) + ");"
           "d.reloadConfig();found=true;}}found?\"ok\":\"nomatch\";")
     return kde_eval(js)
+
+
+def plugin_values(wdir):
+    """The three settings the Wallpaper Engine plugin stores for a wallpaper, in the format it writes itself:
+    SteamLibraryPath=<steam root>, WallpaperSource=file:<media file>+<type>, WallpaperWorkShopId=<id>."""
+    d = Path(wdir)
+    try:
+        j = json.loads((d / "project.json").read_text(encoding="utf-8-sig", errors="replace"))
+    except Exception:
+        j = {}
+    kind = str(j.get("type", "scene")).lower()
+    f = str(j.get("file", ""))
+    media = d / f if f else d
+    if kind == "scene" and not media.is_file() and (d / "scene.pkg").is_file():
+        media = d / "scene.pkg"                     # scenes are shipped packed
+    parts = d.parts
+    if "steamapps" in parts:
+        lib = str(Path(*parts[:parts.index("steamapps")]))
+    else:
+        dirs = steam_apps_dirs()
+        lib = str(dirs[0].parent) if dirs else str(Path.home() / ".local/share/Steam")
+    return f"file:{media}+{kind}", lib, d.name
 
 
 def kde_stop_plugin():
