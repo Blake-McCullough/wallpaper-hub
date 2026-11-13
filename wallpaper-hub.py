@@ -35,7 +35,7 @@ CFG_FILE = CFG_DIR / "config.json"
 PID_FILE = DATA_DIR / "engine.pid"
 LOG_FILE = DATA_DIR / "engine.log"
 AUTOSTART = Path.home() / ".config/autostart/wallpaper-hub.desktop"
-__version__ = "1.3.2"
+__version__ = "1.3.3"
 PLUGIN_ID = "com.github.catsout.wallpaperEngineKde"   # Wallpaper Engine for KDE (Plasma wallpaper plugin)
 REPO = "Blake-McCullough/wallpaper-hub"
 SCRIPT = Path(os.path.realpath(__file__))
@@ -200,6 +200,7 @@ def scan(paths):
                 "dir": str(d),
                 "title": str(j.get("title", d.name)),
                 "type": str(j.get("type", "scene")).lower(),
+                "file": str(j.get("file", "")),
                 "tags": [str(t) for t in j.get("tags", [])] if isinstance(j.get("tags"), list) else [],
                 "preview": str(preview) if preview else "",
             })
@@ -568,6 +569,28 @@ def resolve_backend(cfg):
     return b
 
 
+IMAGE_EXT = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tga"}      # (.gif moves, so it counts as animated)
+
+
+def animated_available(cfg):
+    b = resolve_backend(cfg)
+    return plugin_installed() if b == "plasma" else bool(engine_path())
+
+
+def plan_for(it, cfg):
+    """Decide how a wallpaper should be applied: ('animated' | 'static', explanation)."""
+    suffix = Path(it.get("file", "")).suffix.lower()
+    if it["type"] == "image" or (it["type"] not in ("scene", "video", "web") and suffix in IMAGE_EXT):
+        return "static", "A still picture, so it's set as a normal wallpaper."
+    if it["type"] == "application":
+        return "static", "Application wallpapers are Windows-only, so its preview picture is used instead."
+    if animated_available(cfg):
+        how = "Plasma's Wallpaper Engine plugin" if resolve_backend(cfg) == "plasma" else "linux-wallpaperengine"
+        return "animated", f"Animated: applied through {how}."
+    return "static", ("Nothing is installed to play animated wallpapers, so a still frame is used. "
+                      "Install wallpaper-engine-kde-plugin-git for animation.")
+
+
 def kde_eval(js):
     qd = shutil.which("qdbus6") or shutil.which("qdbus") or shutil.which("qdbus-qt6")
     if not qd:
@@ -697,26 +720,17 @@ def desktop_env():
     return os.environ.get("XDG_CURRENT_DESKTOP", "").lower()
 
 
-def kde_set_on_screen(path, geo):
-    """Set the Plasma wallpaper of ONE monitor, found by its geometry (x, y, w, h)."""
-    x, y, w, h = geo
-    qd = shutil.which("qdbus6") or shutil.which("qdbus") or shutil.which("qdbus-qt6")
-    if not qd:
-        return False, "qdbus6 not found (needed to target a single monitor on Plasma)."
-    js = (
-        f'var uri="{Path(path).as_uri()}"; var found=false; var ds=desktops();'
-        "for (var i=0;i<ds.length;i++){var d=ds[i]; var g=screenGeometry(d.screen);"
-        f"if(g.x=={x}&&g.y=={y}&&g.width=={w}&&g.height=={h}){{"
-        'd.wallpaperPlugin="org.kde.image"; d.currentConfigGroup=["Wallpaper","org.kde.image","General"];'
-        'd.writeConfig("Image",uri); d.reloadConfig(); found=true;}}}'
-        'found ? "ok" : "nomatch";'
-    )
-    ok, out = run([qd, "org.kde.plasmashell", "/PlasmaShell", "org.kde.PlasmaShell.evaluateScript", js])
-    if not ok:
-        return False, out or "Plasma didn't accept the request."
-    if "nomatch" in out:
-        return False, "Couldn't match that monitor in Plasma."
-    return True, "ok"
+def kde_set_on_screen(path, geo=None):
+    """Set Plasma's normal picture wallpaper on one monitor (geo = x, y, w, h) or on all of them.
+    Also switches the monitor away from the animated Wallpaper Engine plugin."""
+    cond = "true" if not geo else "(g.x==%d&&g.y==%d&&g.width==%d&&g.height==%d)" % tuple(geo)
+    js = ("var uri=" + json.dumps(Path(path).as_uri()) + ";var found=false;var ds=desktops();"
+          "for(var i=0;i<ds.length;i++){var d=ds[i];var g=screenGeometry(d.screen);"
+          "if(" + cond + "){d.wallpaperPlugin=\"org.kde.image\";"
+          "d.currentConfigGroup=[\"Wallpaper\",\"org.kde.image\",\"General\"];"
+          "d.writeConfig(\"Image\",uri);d.reloadConfig();found=true;}}"
+          "found?\"ok\":\"nomatch\";")
+    return kde_eval(js)
 
 
 def set_static_desktop(path, geo=None):
@@ -724,11 +738,12 @@ def set_static_desktop(path, geo=None):
     de = desktop_env()
     uri = Path(path).as_uri()
     if "kde" in de:
-        if geo:
-            return kde_set_on_screen(path, geo)
-        tool = shutil.which("plasma-apply-wallpaperimage")
+        ok, msg = kde_set_on_screen(path, geo)
+        if ok or geo:
+            return ok, msg
+        tool = shutil.which("plasma-apply-wallpaperimage")      # all monitors: fall back to KDE's own tool
         if not tool:
-            return False, "plasma-apply-wallpaperimage not found."
+            return False, msg
         return run([tool, path])
     note = " (this desktop only supports one image for all monitors)" if geo else ""
     if "gnome" in de or "cinnamon" in de or "budgie" in de:
@@ -1364,15 +1379,18 @@ class Main(QMainWindow):
         v.addWidget(self.title)
         v.addWidget(self.meta)
         v.addWidget(self.warn)
+        self.plan = QLabel("")
+        self.plan.setWordWrap(True)
+        v.addWidget(self.plan)
 
         row, self.target, self.scaling_box = self.apply_row()
         v.addLayout(row)
 
-        b_apply = QPushButton("Apply to desktop (animated)")
+        b_apply = QPushButton("Set as wallpaper (picks animated or still automatically)")
         b_apply.clicked.connect(self.apply_selected)
         b_stop = QPushButton("Stop animated wallpaper")
         b_stop.clicked.connect(self.stop_clicked)
-        b_static = QPushButton("Set as static desktop image")
+        b_static = QPushButton("Use a still image instead")
         b_static.clicked.connect(self.static_selected)
         b_lock = QPushButton("Set as lock screen image")
         b_lock.clicked.connect(self.lock_selected)
@@ -1661,6 +1679,10 @@ class Main(QMainWindow):
         except Exception:
             pass
         src = Path(it["dir"]) / f if f else None
+        if src and src.is_file() and src.suffix.lower() in IMAGE_EXT:     # an image wallpaper: use the real picture
+            img = QImage(str(src))
+            if not img.isNull():
+                return img
         if it["type"] == "video" and src and src.is_file() and shutil.which("ffmpeg"):
             out = DATA_DIR / "static" / f"{it['id']}-frame.png"
             out.parent.mkdir(parents=True, exist_ok=True)
@@ -1757,6 +1779,7 @@ class Main(QMainWindow):
             self.preview.setPixmap(pm.scaled(340, 192, Qt.AspectRatioMode.KeepAspectRatio,
                                              Qt.TransformationMode.SmoothTransformation))
         self.title.setText(it["title"])
+        self.plan.setText(plan_for(it, self.cfg)[1])
         self.meta.setText(f"{it['type']} · {it['id']}" + (f"\n{', '.join(it['tags'])}" if it["tags"] else ""))
         self.warn.setText("Application-type wallpapers are Windows executables and won't run on Linux."
                           if it["type"] == "application" else
@@ -1865,8 +1888,8 @@ class Main(QMainWindow):
         self.b_sub.setVisible(not installed)
         self.b_set.setText("Set as desktop wallpaper" if installed else "Download && set as desktop wallpaper")
         if installed:
-            self.ex_status.setText("✓ Installed")
-        elif self.ex_status.text() == "✓ Installed":
+            self.ex_status.setText("✓ Installed. " + plan_for(self.local_item(it["id"]), self.cfg)[1])
+        elif self.ex_status.text().startswith("✓ Installed"):
             self.ex_status.setText("")
         if args:
             self.right.setCurrentIndex(1)
@@ -2053,6 +2076,10 @@ class Main(QMainWindow):
         names = [s.name() for s in QApplication.screens()]
         if self.cfg["layout"] == "duplicate":
             target = "*"
+        mode, note = plan_for(it, self.cfg)
+        if mode == "static":
+            self.apply_static(it, target, note)
+            return
         self.cfg["assignments"] = {k: v for k, v in self.cfg["assignments"].items() if k in names}
         for n in (names if target == "*" else [target]):
             self.cfg["assignments"][n] = it["dir"]
@@ -2070,6 +2097,19 @@ class Main(QMainWindow):
             ok, msg = start_engine(self.cfg)
             self.report(ok, msg, f"Applied “{it['title']}” to {where}")
             self.apply_hint.setText(session_hint() if ok else "")
+        self.refresh_status()
+
+    def apply_static(self, it, target, note=""):
+        """Set a still picture as the wallpaper of one monitor or all of them (no animation running)."""
+        stop_engine()
+        scr = next((s for s in QApplication.screens() if s.name() == target), None) if target != "*" else None
+        png = self.export_png(it, scr)
+        if not png:
+            return QMessageBox.warning(self, "Wallpaper Hub", "This wallpaper has no usable image.")
+        g = scr.geometry() if scr else None
+        ok, msg = set_static_desktop(png, (g.x(), g.y(), g.width(), g.height()) if g else None)
+        self.report(ok, msg, f"Set “{it['title']}” on {scr.name() if scr else 'all screens'}. {note}")
+        self.apply_hint.setText(note if ok else "")
         self.refresh_status()
 
     def show_log(self):
