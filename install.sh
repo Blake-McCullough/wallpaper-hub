@@ -10,9 +10,11 @@ echo "==> Installing Qt bindings"
 sudo pacman -S --needed --noconfirm python-pyqt6 python-pyqt6-webengine
 
 # Plasma's own Wallpaper Engine plugin is what actually shows the wallpapers (no renderer of our own).
+# (answers are read from the terminal, so this also works when piped from curl)
 aur() {
-  if command -v paru >/dev/null 2>&1; then paru -S --needed "$@"
-  elif command -v yay >/dev/null 2>&1; then yay -S --needed "$@"
+  local in=/dev/stdin; [ -r /dev/tty ] && in=/dev/tty
+  if command -v paru >/dev/null 2>&1; then paru -S --needed "$@" < "$in" || echo "!! AUR install failed or was cancelled: paru -S $*"
+  elif command -v yay >/dev/null 2>&1; then yay -S --needed "$@" < "$in" || echo "!! AUR install failed or was cancelled: yay -S $*"
   else echo "No AUR helper found. Install paru/yay, then: paru -S $*"; fi
 }
 if [ ! -d /usr/share/plasma/wallpapers/com.github.catsout.wallpaperEngineKde ] && \
