@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-Wallpaper Hub - a GUI for running Wallpaper Engine wallpapers on Linux.
+Wallpaper Hub - a GUI for setting Wallpaper Engine wallpapers as your Linux desktop background.
 
 * My Library: your subscribed / downloaded Wallpaper Engine wallpapers
 * Explore: browse, search, sort and filter the whole Steam Workshop for Wallpaper Engine
-* Runs wallpapers on the desktop through `linux-wallpaperengine` (per-monitor)
+* Sets them through Plasma's own Wallpaper Engine plugin (no renderer of its own);
+  `linux-wallpaperengine` is only an optional fallback for other desktops
 * Sets a static desktop image and the lock screen image (KDE Plasma, GNOME, XFCE for static)
 * `wallpaper-hub --apply` re-applies the saved setup headlessly (used for autostart)
 """
@@ -34,7 +35,8 @@ CFG_FILE = CFG_DIR / "config.json"
 PID_FILE = DATA_DIR / "engine.pid"
 LOG_FILE = DATA_DIR / "engine.log"
 AUTOSTART = Path.home() / ".config/autostart/wallpaper-hub.desktop"
-__version__ = "1.2.0"
+__version__ = "1.3.0"
+PLUGIN_ID = "com.github.catsout.wallpaperEngineKde"   # Wallpaper Engine for KDE (Plasma wallpaper plugin)
 REPO = "Blake-McCullough/wallpaper-hub"
 SCRIPT = Path(os.path.realpath(__file__))
 UA = f"Mozilla/5.0 (X11; Linux x86_64) WallpaperHub/{__version__}"
@@ -54,6 +56,7 @@ DEFAULTS = {
     "disable_parallax": False,
     "scaling": "default",       # default scaling mode for monitors without their own setting
     "screen_scaling": {},       # monitor name -> default / fill / fit / stretch
+    "backend": "auto",          # auto / plasma (Plasma's own wallpaper plugin) / renderer (linux-wallpaperengine)
     "layout": "independent",    # independent: a wallpaper per monitor, duplicate: same one on every monitor
     "clamp": "clamp",
     "autostart": False,
@@ -525,9 +528,12 @@ def session_hint():
 
 
 def diagnostics():
-    cmd = build_command(load_cfg())
+    cfg = load_cfg()
+    cmd = build_command(cfg)
     lines = [f"Session: {os.environ.get('XDG_SESSION_TYPE', '?')}   Desktop: {os.environ.get('XDG_CURRENT_DESKTOP', '?')}",
-             f"Renderer: {engine_path() or 'not installed'}",
+             f"Backend in use: {resolve_backend(cfg)}   (Plasma plugin installed: {'yes' if plugin_installed() else 'no'})",
+             "Plasma plugin settings stored:", plasma_config_excerpt(), "",
+             f"Renderer (optional fallback): {engine_path() or 'not installed'}",
              f"Options it supports: {' '.join(sorted(engine_flags())) or 'unknown'}",
              "Command: " + (shlex.join(cmd) if cmd else "(no wallpaper assigned yet)"), "",
              "--- engine.log (last 80 lines) ---"]
@@ -549,7 +555,73 @@ def engine_pid():
     return None
 
 
+def plugin_installed():
+    return any((base / PLUGIN_ID).is_dir() for base in (Path.home() / ".local/share/plasma/wallpapers",
+                                                         Path("/usr/share/plasma/wallpapers")))
+
+
+def resolve_backend(cfg):
+    """'plasma' = hand the wallpaper to Plasma's own Wallpaper Engine plugin; 'renderer' = run linux-wallpaperengine."""
+    b = cfg.get("backend", "auto")
+    if b == "auto":
+        return "plasma" if ("kde" in desktop_env() and plugin_installed()) else "renderer"
+    return b
+
+
+def kde_eval(js):
+    qd = shutil.which("qdbus6") or shutil.which("qdbus") or shutil.which("qdbus-qt6")
+    if not qd:
+        return False, "qdbus6 not found (it ships with Plasma's Qt tools)."
+    ok, out = run([qd, "org.kde.plasmashell", "/PlasmaShell", "org.kde.PlasmaShell.evaluateScript", js])
+    if not ok:
+        return False, out or "Plasma didn't accept the request (is plasmashell running?)."
+    if "nomatch" in out:
+        return False, "Couldn't match that monitor in Plasma."
+    return True, "ok"
+
+
+def kde_apply_plugin(wdir, geo=None, scaling="default"):
+    """Make Plasma's Wallpaper Engine plugin show `wdir` on one monitor (geo = x,y,w,h) or on all monitors."""
+    if not plugin_installed():
+        return False, ("The Wallpaper Engine plugin for Plasma isn't installed.\n\n"
+                       "Install it with:  paru -S wallpaper-engine-kde-plugin-git\n"
+                       "then restart Plasma (log out and in).")
+    cond = "true" if not geo else "(g.x==%d&&g.y==%d&&g.width==%d&&g.height==%d)" % tuple(geo)
+    fill = {"stretch": 0, "fit": 1, "fill": 2}.get(scaling)        # Qt Image fillMode values
+    js = ("var found=false;var ds=desktops();for(var i=0;i<ds.length;i++){var d=ds[i];var g=screenGeometry(d.screen);"
+          "if(" + cond + "){d.wallpaperPlugin=" + json.dumps(PLUGIN_ID) + ";"
+          "d.currentConfigGroup=[\"Wallpaper\"," + json.dumps(PLUGIN_ID) + ",\"General\"];"
+          "d.writeConfig(\"WallpaperSource\"," + json.dumps(wdir) + ");"
+          + ("d.writeConfig(\"FillMode\"," + str(fill) + ");" if fill is not None else "") +
+          "d.reloadConfig();found=true;}}found?\"ok\":\"nomatch\";")
+    return kde_eval(js)
+
+
+def kde_stop_plugin():
+    """Go back to Plasma's normal picture wallpaper on every monitor that is using the Wallpaper Engine plugin."""
+    js = ("var ds=desktops();for(var i=0;i<ds.length;i++){var d=ds[i];if(d.wallpaperPlugin==" + json.dumps(PLUGIN_ID) +
+          "){d.wallpaperPlugin=\"org.kde.image\";d.reloadConfig();}}\"ok\";")
+    return kde_eval(js)
+
+
+def plasma_config_excerpt():
+    """The lines Plasma stored for the plugin, for diagnostics."""
+    f = Path.home() / ".config/plasma-org.kde.plasma.desktop-appletsrc"
+    try:
+        lines = f.read_text(errors="replace").splitlines()
+    except Exception:
+        return "(couldn't read plasma-org.kde.plasma.desktop-appletsrc)"
+    out, show = [], False
+    for ln in lines:
+        if ln.startswith("["):
+            show = "wallpaperEngineKde" in ln
+        if show:
+            out.append(ln)
+    return "\n".join(out) or "(no Wallpaper Engine plugin section stored yet)"
+
+
 def stop_engine():
+    run(["pkill", "-x", "linux-wallpaperengine"], timeout=5)      # also catches renderers left over from older runs
     pid = engine_pid()
     if pid:
         try:
@@ -1105,11 +1177,12 @@ class Main(QMainWindow):
         self.timer.start(3000)
         if self.cfg["check_updates"]:
             QTimer.singleShot(2500, self.check_updates)
-        if not engine_path():
+        if resolve_backend(self.cfg) == "renderer" and not engine_path():
             QTimer.singleShot(400, lambda: QMessageBox.warning(
-                self, "linux-wallpaperengine missing",
-                "The renderer isn't installed, so wallpapers can't run on the desktop yet.\n\n"
-                "Install it with:  paru -S linux-wallpaperengine-git\n(or run install.sh)"))
+                self, "Wallpaper Engine support missing",
+                "Nothing is installed that can show Wallpaper Engine wallpapers yet.\n\n"
+                "On KDE Plasma, install the plugin:  paru -S wallpaper-engine-kde-plugin-git\n"
+                "(then log out and in).\n\nOr install the standalone renderer: paru -S linux-wallpaperengine-git"))
 
     # ---- threads ----------------------------------------------------------
     def spawn(self, t):
@@ -1369,6 +1442,16 @@ class Main(QMainWindow):
         vol.setValue(c["volume"])
         vol.valueChanged.connect(lambda v: self.setc("volume", v))
         f.addRow("Volume", vol)
+
+        be = QComboBox()
+        be.addItem("Automatic (Plasma plugin if installed)", "auto")
+        be.addItem("Plasma's Wallpaper Engine plugin", "plasma")
+        be.addItem("linux-wallpaperengine renderer (own window)", "renderer")
+        be.setCurrentIndex(max(0, be.findData(c["backend"])))
+        be.currentIndexChanged.connect(lambda *_: self.setc("backend", be.currentData()))
+        f.addRow("How wallpapers are applied", be)
+        f.addRow(QLabel("FPS, volume and the options below only apply to the linux-wallpaperengine renderer; "
+                        "with Plasma's plugin set them in Plasma's own wallpaper settings."))
 
         lay = QComboBox()
         lay.addItem("Independent: a wallpaper per monitor", "independent")
@@ -1952,10 +2035,18 @@ class Main(QMainWindow):
             self.cfg["assignments"][n] = it["dir"]
             self.cfg["screen_scaling"][n] = scaling
         save_cfg(self.cfg)
-        ok, msg = start_engine(self.cfg)
-        self.report(ok, msg, f"Applied “{it['title']}” to "
-                             f"{'all screens' if target == '*' else target}")
-        self.apply_hint.setText(session_hint() if ok else "")
+        where = "all screens" if target == "*" else target
+        if resolve_backend(self.cfg) == "plasma":
+            stop_engine()                       # no stray renderer fighting with Plasma
+            scr = next((s for s in QApplication.screens() if s.name() == target), None)
+            g = scr.geometry() if (scr and target != "*") else None
+            ok, msg = kde_apply_plugin(it["dir"], (g.x(), g.y(), g.width(), g.height()) if g else None, scaling)
+            self.report(ok, msg, f"Applied “{it['title']}” to {where} through Plasma")
+            self.apply_hint.setText("")
+        else:
+            ok, msg = start_engine(self.cfg)
+            self.report(ok, msg, f"Applied “{it['title']}” to {where}")
+            self.apply_hint.setText(session_hint() if ok else "")
         self.refresh_status()
 
     def show_log(self):
@@ -1975,12 +2066,25 @@ class Main(QMainWindow):
         d.exec()
 
     def restart_clicked(self):
-        ok, msg = start_engine(self.cfg)
-        self.report(ok, msg, "Restarted")
+        if resolve_backend(self.cfg) == "plasma":
+            ok, msg = True, ""
+            for scr_name, wdir in self.cfg["assignments"].items():
+                scr = next((s for s in QApplication.screens() if s.name() == scr_name), None)
+                g = scr.geometry() if scr else None
+                ok, msg = kde_apply_plugin(wdir, (g.x(), g.y(), g.width(), g.height()) if g else None,
+                                           self.cfg["screen_scaling"].get(scr_name, self.cfg["scaling"]))
+                if not ok:
+                    break
+        else:
+            ok, msg = start_engine(self.cfg)
+        self.report(ok, msg, "Re-applied")
         self.refresh_status()
 
     def stop_clicked(self):
+        """Back to a normal (non-animated) wallpaper: leaves the plugin and stops any renderer."""
         stop_engine()
+        if "kde" in desktop_env() and plugin_installed():
+            kde_stop_plugin()
         self.refresh_status()
 
     def static_selected(self):
@@ -2026,12 +2130,18 @@ class Main(QMainWindow):
     def refresh_status(self):
         pid = engine_pid()
         by_dir = {it["dir"]: it["title"] for it in self.items}
-        lines = [f"Engine: {'running (pid %d)' % pid if pid else 'stopped'}"]
+        if resolve_backend(self.cfg) == "plasma":
+            lines = ["Applied through Plasma's Wallpaper Engine plugin" if plugin_installed()
+                     else "Plasma's Wallpaper Engine plugin is NOT installed"]
+        else:
+            lines = [f"Engine: {'running (pid %d)' % pid if pid else 'stopped'}"]
         for scr, d in self.cfg["assignments"].items():
             lines.append(f"  {scr} → {by_dir.get(d, Path(d).name)}")
         self.status.setText("\n".join(lines))
         paths, assets = library_info(self.cfg)
-        self.info.setText(f"Renderer: {engine_path() or 'NOT INSTALLED'}\n"
+        self.info.setText(f"Backend: {resolve_backend(self.cfg)}   Plasma plugin: "
+                          f"{'installed' if plugin_installed() else 'not installed'}\n"
+                          f"Renderer (optional): {engine_path() or 'not installed'}\n"
                           f"steamcmd: {shutil.which('steamcmd') or 'not installed (optional)'}\n"
                           f"Assets: {assets or 'not found'}\nLibraries: {', '.join(paths) or 'none found'}\n"
                           f"Log: {LOG_FILE}")

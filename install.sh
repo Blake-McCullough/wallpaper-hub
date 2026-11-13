@@ -9,15 +9,22 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || echo .)"
 echo "==> Installing Qt bindings"
 sudo pacman -S --needed --noconfirm python-pyqt6 python-pyqt6-webengine
 
-if ! command -v linux-wallpaperengine >/dev/null 2>&1; then
-  echo "==> Installing linux-wallpaperengine (renderer)"
-  if command -v paru >/dev/null 2>&1; then
-    paru -S --needed linux-wallpaperengine-git
-  elif command -v yay >/dev/null 2>&1; then
-    yay -S --needed linux-wallpaperengine-git
-  else
-    echo "No AUR helper found. Install paru/yay, then: paru -S linux-wallpaperengine-git"
-  fi
+# Plasma's own Wallpaper Engine plugin is what actually shows the wallpapers (no renderer of our own).
+aur() {
+  if command -v paru >/dev/null 2>&1; then paru -S --needed "$@"
+  elif command -v yay >/dev/null 2>&1; then yay -S --needed "$@"
+  else echo "No AUR helper found. Install paru/yay, then: paru -S $*"; fi
+}
+if [ ! -d /usr/share/plasma/wallpapers/com.github.catsout.wallpaperEngineKde ] && \
+   [ ! -d "$HOME/.local/share/plasma/wallpapers/com.github.catsout.wallpaperEngineKde" ]; then
+  echo "==> Installing the Wallpaper Engine plugin for Plasma"
+  aur wallpaper-engine-kde-plugin-git
+  echo "    (log out and back in once so Plasma loads the plugin)"
+fi
+# Optional standalone renderer for non-KDE desktops:  ./install.sh --with-renderer
+if [ "$1" = "--with-renderer" ] && ! command -v linux-wallpaperengine >/dev/null 2>&1; then
+  echo "==> Installing linux-wallpaperengine (optional renderer)"
+  aur linux-wallpaperengine-git
 fi
 
 echo "==> Installing app"

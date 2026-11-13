@@ -1,14 +1,17 @@
 # Wallpaper Hub
 
-A small GUI for running Wallpaper Engine wallpapers on CachyOS/Linux.
+A small GUI for browsing Wallpaper Engine wallpapers and setting them as your desktop background on CachyOS/KDE Plasma.
+It has no renderer of its own: it hands the wallpaper to Plasma's built-in wallpaper system through the
+[Wallpaper Engine for KDE](https://github.com/catsout/wallpaper-engine-kde-plugin) plugin.
 
 ## Install
 From a clone: `chmod +x install.sh && ./install.sh`, or without cloning:
 ```bash
 curl -fsSL https://github.com/Blake-McCullough/wallpaper-hub/releases/latest/download/install.sh | bash
 ```
-Installs `python-pyqt6`, `python-pyqt6-webengine` (for signing in to Steam), the renderer
-`linux-wallpaperengine-git` (AUR), the app in `~/.local/bin`, and a "Wallpaper Hub" menu entry.
+Installs `python-pyqt6`, `python-pyqt6-webengine` (for signing in to Steam), the Plasma plugin
+`wallpaper-engine-kde-plugin-git` (AUR; log out and in once afterwards), the app in `~/.local/bin`, and a menu entry.
+`./install.sh --with-renderer` also installs the standalone `linux-wallpaperengine` (only needed off KDE).
 
 ## Updating
 The app checks this repo's GitHub releases on startup. When a newer one exists a blue bar appears:
