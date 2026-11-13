@@ -14,7 +14,9 @@ Installs `python-pyqt6`, the renderer `linux-wallpaperengine-git` (AUR), and a "
 
 ## Explore the Workshop
 The **Explore Workshop** tab browses the whole Wallpaper Engine Workshop from inside the app: search, sort
-(trending / most popular / most recent / recently updated), time period, type, category, rating and paging.
+(trending / most popular / most recent / recently updated), time period and paging. **Filters…** opens the
+Workshop tag panel (Type, Age rating, Genre, Category, Special, plus any custom tag): click a tag to require it (✓)
+or exclude it (✕), e.g. exclude Anime. Your filters are remembered.
 Wallpapers you already have show a ✓.
 - **Subscribe in Steam** opens the item in your Steam client; press Subscribe there and Steam downloads it.
   It appears in **My Library** automatically once the download finishes.

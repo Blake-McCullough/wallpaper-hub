@@ -49,6 +49,8 @@ DEFAULTS = {
     "scaling": "default",
     "clamp": "clamp",
     "autostart": False,
+    "ex_include": ["Everyone"], # Explore: tags a wallpaper must have
+    "ex_exclude": [],           # Explore: tags a wallpaper must NOT have (e.g. "Anime")
     "steam_api_key": "",        # optional: makes Explore far more reliable
     "steamcmd_user": "",        # optional: enables direct downloads without clicking Subscribe in Steam
 }
@@ -58,12 +60,17 @@ SORTS = [("Trending", "trend"), ("Most popular", "totaluniquesubscribers"),
          ("Most recent", "mostrecent"), ("Recently updated", "lastupdated")]
 PERIODS = [("Today", 1), ("This week", 7), ("This month", 30), ("3 months", 90),
            ("6 months", 180), ("This year", 365), ("All time", -1)]
-TYPES = ["Any type", "Scene", "Video", "Web"]
-CATEGORIES = ["Any category", "Abstract", "Animal", "Anime", "Cartoon", "CGI", "Cyberpunk", "Fantasy",
-              "Game", "Girls", "Guys", "Landscape", "Medieval", "Memes", "MMD", "Music", "Nature",
-              "Pixel art", "Relaxing", "Retro", "Sci-Fi", "Sports", "Technology", "Television",
-              "Vehicle", "Unspecified"]
-RATINGS = ["Everyone", "Questionable", "Mature"]
+# Tag groups as shown in Wallpaper Engine's Workshop filter panel. Each tag can be required or excluded.
+FILTER_GROUPS = [
+    ("Type", ["Scene", "Video", "Web", "Application"]),
+    ("Age rating", ["Everyone", "Questionable", "Mature"]),
+    ("Genre", ["Abstract", "Animal", "Anime", "Cartoon", "CGI", "Cyberpunk", "Fantasy", "Game", "Girls",
+               "Guys", "Landscape", "Medieval", "Memes", "MMD", "Music", "Nature", "Pixel art", "Relaxing",
+               "Retro", "Sci-Fi", "Sports", "Technology", "Television", "Vehicle", "Unspecified"]),
+    ("Category", ["Wallpaper", "Preset", "Asset"]),
+    ("Special", ["Approved", "Audio responsive", "3D", "Customizable", "Puppet Warp", "HDR",
+                 "Media Integration", "User Shortcut", "Video Texture", "Asset Pack", "Miscellaneous"]),
+]
 API_QUERY_TYPE = {"trend": 3, "totaluniquesubscribers": 9, "mostrecent": 1, "lastupdated": 21}
 API_TEXT_SEARCH = 12
 
@@ -205,14 +212,11 @@ def cache_file(url):
 
 
 def query_tags(q):
-    tags = []
-    if q.get("type") and q["type"] != TYPES[0]:
-        tags.append(q["type"])
-    if q.get("category") and q["category"] != CATEGORIES[0]:
-        tags.append(q["category"])
-    if q.get("rating"):
-        tags.append(q["rating"])
-    return tags
+    return [t for t in q.get("include", []) if t]
+
+
+def query_excluded(q):
+    return [t for t in q.get("exclude", []) if t]
 
 
 def scrape_url(q):
@@ -222,6 +226,8 @@ def scrape_url(q):
               ("browsesort", sort), ("section", "readytouseitems")]
     for t in query_tags(q):
         params.append(("requiredtags[]", t))
+    for t in query_excluded(q):
+        params.append(("excludedtags[]", t))
     params += [("actualsort", sort), ("p", str(q.get("page", 1)))]
     if sort == "trend":
         params.append(("days", str(q.get("days", 7))))
@@ -241,6 +247,8 @@ def api_url(q, key):
         params.append(("days", str(d if d > 0 else 3650)))
     for i, t in enumerate(query_tags(q)):
         params.append((f"requiredtags[{i}]", t))
+    for i, t in enumerate(query_excluded(q)):
+        params.append((f"excludedtags[{i}]", t))
     return "https://api.steampowered.com/IPublishedFileService/QueryFiles/v1/?" + urllib.parse.urlencode(params)
 
 
@@ -520,9 +528,10 @@ if __name__ == "__main__" and "--apply" in sys.argv:
 from PyQt6.QtCore import Qt, QSize, QThread, QTimer, QUrl, pyqtSignal  # noqa: E402
 from PyQt6.QtGui import QColor, QDesktopServices, QIcon, QImage, QPixmap  # noqa: E402
 from PyQt6.QtWidgets import (  # noqa: E402
-    QApplication, QCheckBox, QComboBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel,
-    QLineEdit, QListView, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
-    QPushButton, QSlider, QSpinBox, QSplitter, QSystemTrayIcon, QTabWidget, QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout, QGridLayout, QGroupBox,
+    QHBoxLayout, QLabel, QLineEdit, QListView, QListWidget, QListWidgetItem, QMainWindow, QMenu,
+    QMessageBox, QPushButton, QScrollArea, QSlider, QSpinBox, QSplitter, QSystemTrayIcon, QTabWidget,
+    QVBoxLayout, QWidget,
 )
 
 UR = Qt.ItemDataRole.UserRole
@@ -645,6 +654,117 @@ class SteamCmdThread(QThread):
             self.done.emit(False, str(e))
 
 
+class TagButton(QPushButton):
+    """Click cycles: off -> required (green ✓) -> excluded (red ✕) -> off."""
+    changed = pyqtSignal()
+    STYLES = {
+        0: "",
+        1: "background:#2e7d32;color:white;font-weight:bold;",
+        2: "background:#b71c1c;color:white;font-weight:bold;",
+    }
+
+    def __init__(self, tag, state=0):
+        super().__init__()
+        self.tag, self.state = tag, state
+        self.clicked.connect(self.cycle)
+        self.paint()
+
+    def cycle(self):
+        self.state = (self.state + 1) % 3
+        self.paint()
+        self.changed.emit()
+
+    def set_state(self, s):
+        self.state = s
+        self.paint()
+
+    def paint(self):
+        self.setText({0: "", 1: "✓ ", 2: "✕ "}[self.state] + self.tag)
+        self.setStyleSheet(self.STYLES[self.state])
+        self.setToolTip("Click to cycle: off → must have → must NOT have")
+
+
+class FilterDialog(QDialog):
+    """Wallpaper Engine style tag filters with include / exclude, plus custom tags."""
+
+    def __init__(self, parent, include, exclude):
+        super().__init__(parent)
+        self.setWindowTitle("Workshop filters")
+        self.resize(640, 640)
+        self.buttons = {}
+        known = {t for _, tags in FILTER_GROUPS for t in tags}
+        v = QVBoxLayout(self)
+        v.addWidget(QLabel("Click a tag to cycle: <b style='color:#2e7d32'>✓ must have</b> → "
+                           "<b style='color:#b71c1c'>✕ must NOT have</b> → off.<br>"
+                           "Required tags must all match. “Mature” results only appear with a Steam Web API key."))
+        area = QScrollArea()
+        area.setWidgetResizable(True)
+        inner = QWidget()
+        iv = QVBoxLayout(inner)
+        for name, tags in FILTER_GROUPS:
+            iv.addWidget(self.group(name, tags, include, exclude))
+        custom = [t for t in [*include, *exclude] if t not in known]
+        self.custom_box = self.group("Custom tags", custom, include, exclude)
+        iv.addWidget(self.custom_box)
+        row = QHBoxLayout()
+        self.custom_edit = QLineEdit()
+        self.custom_edit.setPlaceholderText("Any other tag, e.g. a resolution like “3440 x 1440”")
+        self.custom_edit.returnPressed.connect(lambda: self.add_custom(1))
+        b1 = QPushButton("Require")
+        b1.clicked.connect(lambda: self.add_custom(1))
+        b2 = QPushButton("Exclude")
+        b2.clicked.connect(lambda: self.add_custom(2))
+        for w in (self.custom_edit, b1, b2):
+            row.addWidget(w)
+        row.setStretch(0, 1)
+        iv.addLayout(row)
+        iv.addStretch(1)
+        area.setWidget(inner)
+        v.addWidget(area, 1)
+
+        bottom = QHBoxLayout()
+        clear = QPushButton("Clear all")
+        clear.clicked.connect(lambda: [b.set_state(0) for b in self.buttons.values()])
+        ok = QPushButton("Apply")
+        ok.setDefault(True)
+        ok.clicked.connect(self.accept)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        bottom.addWidget(clear)
+        bottom.addStretch(1)
+        bottom.addWidget(cancel)
+        bottom.addWidget(ok)
+        v.addLayout(bottom)
+
+    def group(self, name, tags, include, exclude):
+        box = QGroupBox(name)
+        g = QGridLayout(box)
+        box.grid = g
+        for i, t in enumerate(tags):
+            self.place(g, i, t, 1 if t in include else 2 if t in exclude else 0)
+        return box
+
+    def place(self, grid, i, tag, state):
+        b = TagButton(tag, state)
+        self.buttons[tag] = b
+        grid.addWidget(b, i // 4, i % 4)
+
+    def add_custom(self, state):
+        t = self.custom_edit.text().strip()
+        if not t:
+            return
+        if t in self.buttons:
+            self.buttons[t].set_state(state)
+        else:
+            self.place(self.custom_box.grid, len(self.buttons), t, state)
+        self.custom_edit.clear()
+
+    def result_tags(self):
+        inc = [t for t, b in self.buttons.items() if b.state == 1]
+        exc = [t for t, b in self.buttons.items() if b.state == 2]
+        return inc, exc
+
+
 class Main(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -758,16 +878,17 @@ class Main(QMainWindow):
         for label, val in PERIODS:
             self.ex_period.addItem(label, val)
         self.ex_period.setCurrentIndex(1)
-        self.ex_type = QComboBox()
-        self.ex_type.addItems(TYPES)
-        self.ex_cat = QComboBox()
-        self.ex_cat.addItems(CATEGORIES)
-        self.ex_rating = QComboBox()
-        self.ex_rating.addItems(RATINGS)
-        for c in (self.ex_sort, self.ex_period, self.ex_type, self.ex_cat, self.ex_rating):
+        for c in (self.ex_sort, self.ex_period):
             c.currentIndexChanged.connect(self.ex_filter_changed)
             r2.addWidget(c)
+        self.ex_filters_btn = QPushButton("Filters…")
+        self.ex_filters_btn.clicked.connect(self.edit_filters)
+        r2.addWidget(self.ex_filters_btn)
+        self.ex_chips = QLabel("")
+        self.ex_chips.setWordWrap(True)
+        r2.addWidget(self.ex_chips, 1)
         v.addLayout(r2)
+        self.update_chips()
 
         self.ex_grid = make_grid()
         self.ex_grid.currentItemChanged.connect(self.show_ex_item)
@@ -1081,9 +1202,25 @@ class Main(QMainWindow):
         return {
             "text": self.ex_search.text(), "page": page,
             "sort": self.ex_sort.currentData(), "days": self.ex_period.currentData(),
-            "type": self.ex_type.currentText(), "category": self.ex_cat.currentText(),
-            "rating": self.ex_rating.currentText(),
+            "include": list(self.cfg["ex_include"]), "exclude": list(self.cfg["ex_exclude"]),
         }
+
+    def update_chips(self):
+        inc, exc = self.cfg["ex_include"], self.cfg["ex_exclude"]
+        chips = [f"<span style='color:#2e7d32'>✓ {htmllib.escape(t)}</span>" for t in inc] + \
+                [f"<span style='color:#b71c1c'>✕ {htmllib.escape(t)}</span>" for t in exc]
+        self.ex_chips.setText("  ".join(chips) if chips else "No filters")
+        n = len(inc) + len(exc)
+        self.ex_filters_btn.setText(f"Filters ({n})…" if n else "Filters…")
+
+    def edit_filters(self):
+        d = FilterDialog(self, self.cfg["ex_include"], self.cfg["ex_exclude"])
+        if d.exec() == QDialog.DialogCode.Accepted:
+            inc, exc = d.result_tags()
+            self.cfg["ex_include"], self.cfg["ex_exclude"] = inc, exc
+            save_cfg(self.cfg)
+            self.update_chips()
+            self.ex_run(1)
 
     def ex_filter_changed(self, *_):
         self.ex_period.setEnabled(self.ex_sort.currentData() == "trend")
