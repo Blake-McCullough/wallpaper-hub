@@ -1,29 +1,38 @@
 #!/usr/bin/env python3
 """
-Wallpaper Hub - a small GUI for running Wallpaper Engine wallpapers on Linux.
+Wallpaper Hub - a GUI for running Wallpaper Engine wallpapers on Linux.
 
-* Browses your Steam Workshop / Wallpaper Engine library
+* My Library: your subscribed / downloaded Wallpaper Engine wallpapers
+* Explore: browse, search, sort and filter the whole Steam Workshop for Wallpaper Engine
 * Runs wallpapers on the desktop through `linux-wallpaperengine` (per-monitor)
 * Sets a static desktop image and the lock screen image (KDE Plasma, GNOME, XFCE for static)
 * `wallpaper-hub --apply` re-applies the saved setup headlessly (used for autostart)
 """
+import hashlib
+import html as htmllib
 import json
+import math
 import os
 import re
 import shutil
 import signal
 import subprocess
 import sys
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 APP = "wallpaper-hub"
 WE_APPID = "431960"
 CFG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / APP
 DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / APP
+CACHE_DIR = DATA_DIR / "cache"
 CFG_FILE = CFG_DIR / "config.json"
 PID_FILE = DATA_DIR / "engine.pid"
 LOG_FILE = DATA_DIR / "engine.log"
 AUTOSTART = Path.home() / ".config/autostart/wallpaper-hub.desktop"
+UA = "Mozilla/5.0 (X11; Linux x86_64) WallpaperHub/1.1"
+PER_PAGE = 30
 
 DEFAULTS = {
     "extra_libraries": [],
@@ -40,7 +49,23 @@ DEFAULTS = {
     "scaling": "default",
     "clamp": "clamp",
     "autostart": False,
+    "steam_api_key": "",        # optional: makes Explore far more reliable
+    "steamcmd_user": "",        # optional: enables direct downloads without clicking Subscribe in Steam
 }
+
+# Explore filters --------------------------------------------------------------
+SORTS = [("Trending", "trend"), ("Most popular", "totaluniquesubscribers"),
+         ("Most recent", "mostrecent"), ("Recently updated", "lastupdated")]
+PERIODS = [("Today", 1), ("This week", 7), ("This month", 30), ("3 months", 90),
+           ("6 months", 180), ("This year", 365), ("All time", -1)]
+TYPES = ["Any type", "Scene", "Video", "Web"]
+CATEGORIES = ["Any category", "Abstract", "Animal", "Anime", "Cartoon", "CGI", "Cyberpunk", "Fantasy",
+              "Game", "Girls", "Guys", "Landscape", "Medieval", "Memes", "MMD", "Music", "Nature",
+              "Pixel art", "Relaxing", "Retro", "Sci-Fi", "Sports", "Technology", "Television",
+              "Vehicle", "Unspecified"]
+RATINGS = ["Everyone", "Questionable", "Mature"]
+API_QUERY_TYPE = {"trend": 3, "totaluniquesubscribers": 9, "mostrecent": 1, "lastupdated": 21}
+API_TEXT_SEARCH = 12
 
 
 # ----------------------------------------------------------------------------
@@ -58,6 +83,10 @@ def load_cfg():
 def save_cfg(cfg):
     CFG_DIR.mkdir(parents=True, exist_ok=True)
     CFG_FILE.write_text(json.dumps(cfg, indent=2))
+    try:
+        CFG_FILE.chmod(0o600)   # may contain an API key
+    except Exception:
+        pass
 
 
 def steam_apps_dirs():
@@ -110,6 +139,19 @@ def library_info(cfg):
     return projects, (cfg.get("assets_dir") or assets)
 
 
+def library_signature(paths):
+    """Cheap fingerprint of installed wallpapers; changes when a download finishes."""
+    sig = []
+    for base in paths:
+        try:
+            for d in os.scandir(base):
+                if os.path.isfile(os.path.join(d.path, "project.json")):
+                    sig.append(d.name)
+        except Exception:
+            pass
+    return tuple(sorted(sig))
+
+
 def scan(paths):
     items = []
     for base in paths:
@@ -140,6 +182,178 @@ def scan(paths):
     return items
 
 
+# ---- Workshop (online) -------------------------------------------------------
+def http_get(url, timeout=20):
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+
+def cached_download(url):
+    """Download an image once; later calls read from the on-disk cache."""
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    f = CACHE_DIR / (hashlib.sha1(url.encode()).hexdigest() + ".img")
+    if f.is_file() and f.stat().st_size > 0:
+        return f.read_bytes()
+    data = http_get(url)
+    f.write_bytes(data)
+    return data
+
+
+def cache_file(url):
+    return CACHE_DIR / (hashlib.sha1(url.encode()).hexdigest() + ".img")
+
+
+def query_tags(q):
+    tags = []
+    if q.get("type") and q["type"] != TYPES[0]:
+        tags.append(q["type"])
+    if q.get("category") and q["category"] != CATEGORIES[0]:
+        tags.append(q["category"])
+    if q.get("rating"):
+        tags.append(q["rating"])
+    return tags
+
+
+def scrape_url(q):
+    text = q.get("text", "").strip()
+    sort = "textsearch" if text else q.get("sort", "trend")
+    params = [("appid", WE_APPID), ("searchtext", text), ("childpublishedfileid", "0"),
+              ("browsesort", sort), ("section", "readytouseitems")]
+    for t in query_tags(q):
+        params.append(("requiredtags[]", t))
+    params += [("actualsort", sort), ("p", str(q.get("page", 1)))]
+    if sort == "trend":
+        params.append(("days", str(q.get("days", 7))))
+    return "https://steamcommunity.com/workshop/browse/?" + urllib.parse.urlencode(params)
+
+
+def api_url(q, key):
+    text = q.get("text", "").strip()
+    sort = q.get("sort", "trend")
+    params = [("key", key), ("appid", WE_APPID), ("creator_appid", WE_APPID),
+              ("page", str(q.get("page", 1))), ("numperpage", str(PER_PAGE)),
+              ("query_type", str(API_TEXT_SEARCH if text else API_QUERY_TYPE.get(sort, 3))),
+              ("search_text", text), ("match_all_tags", "true"), ("return_tags", "true"),
+              ("return_short_description", "true"), ("return_vote_data", "true"), ("filetype", "0")]
+    if sort == "trend" and not text:
+        d = int(q.get("days", 7))
+        params.append(("days", str(d if d > 0 else 3650)))
+    for i, t in enumerate(query_tags(q)):
+        params.append((f"requiredtags[{i}]", t))
+    return "https://api.steampowered.com/IPublishedFileService/QueryFiles/v1/?" + urllib.parse.urlencode(params)
+
+
+def _clean(text, limit=700):
+    text = re.sub(r"<[^>]+>", " ", text or "")
+    text = re.sub(r"\[/?[a-zA-Z0-9*=#\" ]+\]", " ", text)       # BBCode
+    text = htmllib.unescape(text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:limit] + ("…" if len(text) > limit else "")
+
+
+def parse_api(raw):
+    r = json.loads(raw).get("response", {})
+    items = []
+    for f in r.get("publishedfiledetails", []) or []:
+        if str(f.get("result", 1)) not in ("1",) and "title" not in f:
+            continue
+        tags = [t.get("display_name") or t.get("tag", "") for t in f.get("tags", []) or []]
+        items.append({
+            "id": str(f.get("publishedfileid", "")),
+            "title": f.get("title") or str(f.get("publishedfileid", "")),
+            "author": "",
+            "preview_url": f.get("preview_url", ""),
+            "desc": _clean(f.get("short_description") or f.get("file_description", "")),
+            "subs": int(f.get("subscriptions", 0) or 0),
+            "tags": [t for t in tags if t],
+        })
+    return [i for i in items if i["id"]], int(r.get("total", len(items)) or 0)
+
+
+def parse_workshop_html(page):
+    """Parse a steamcommunity.com workshop browse page. Tolerant: several strategies are merged."""
+    items, order = {}, []
+
+    def entry(i):
+        if i not in items:
+            items[i] = {"id": i, "title": "", "author": "", "preview_url": "", "desc": "", "subs": 0, "tags": []}
+            order.append(i)
+        return items[i]
+
+    # 1) hover-tooltip JSON that Steam embeds for each item (title + description)
+    dec = json.JSONDecoder()
+    for m in re.finditer(r'SharedFileBindMouseHover\(\s*"sharedfile_(\d+)"\s*,\s*(?:true|false)\s*,\s*', page):
+        try:
+            obj, _ = dec.raw_decode(page, m.end())
+        except Exception:
+            continue
+        e = entry(m.group(1))
+        if isinstance(obj, dict):
+            e["title"] = e["title"] or htmllib.unescape(str(obj.get("title", "")))
+            e["desc"] = e["desc"] or _clean(str(obj.get("description", "")))
+
+    # 2) the item blocks themselves
+    for block in re.split(r'<div[^>]+class="[^"]*\bworkshopItem\b[^"]*"', page)[1:]:
+        m = re.search(r'data-publishedfileid="(\d+)"', block) or re.search(r"filedetails/\?id=(\d+)", block)
+        if not m:
+            continue
+        e = entry(m.group(1))
+        img = re.search(r'<img[^>]+class="[^"]*workshopItemPreviewImage[^"]*"[^>]+src="([^"]+)"', block) \
+            or re.search(r'<img[^>]+src="(https?://[^"]+)"', block)
+        if img and not e["preview_url"]:
+            e["preview_url"] = htmllib.unescape(img.group(1))
+        t = re.search(r'class="[^"]*workshopItemTitle[^"]*"[^>]*>(.*?)</div>', block, re.S)
+        if t and not e["title"]:
+            e["title"] = _clean(t.group(1), 200)
+        a = re.search(r'class="[^"]*workshopItemAuthorName[^"]*"[^>]*>(.*?)</div>', block, re.S)
+        if a:
+            e["author"] = re.sub(r"^\s*by\s*", "", _clean(a.group(1), 80), flags=re.I)
+
+    # 3) fallback: bare anchors to item pages
+    for m in re.finditer(r'<a[^>]+href="[^"]*filedetails/\?id=(\d+)[^"]*"[^>]*>(.*?)</a>', page, re.S):
+        inner = m.group(2)
+        img = re.search(r'<img[^>]+src="(https?://[^"]+)"', inner)
+        alt = re.search(r'<img[^>]+alt="([^"]*)"', inner)
+        if not (img or _clean(inner)):
+            continue
+        e = entry(m.group(1))
+        if img and not e["preview_url"]:
+            e["preview_url"] = htmllib.unescape(img.group(1))
+        if not e["title"]:
+            e["title"] = _clean(inner, 200) or (htmllib.unescape(alt.group(1)) if alt else "")
+    for e in items.values():
+        if re.search(r" by .+$", e["title"]) and e["author"]:
+            e["title"] = e["title"][: -len(" by " + e["author"])].rstrip() if e["title"].endswith(e["author"]) else e["title"]
+        e["title"] = e["title"] or e["id"]
+
+    total = 0
+    m = re.search(r"([\d,]+)\s+entries", page)
+    if m:
+        total = int(m.group(1).replace(",", ""))
+    out = [items[i] for i in order if items[i]["preview_url"] or items[i]["title"] != i]
+    return out, total or len(out)
+
+
+def search_workshop(q, cfg):
+    """Returns (items, total). Uses the Steam Web API if a key is set, otherwise scrapes the Workshop."""
+    key = (cfg.get("steam_api_key") or "").strip()
+    try:
+        if key:
+            return parse_api(http_get(api_url(q, key)))
+        return parse_workshop_html(http_get(scrape_url(q)).decode("utf-8", "replace"))
+    except Exception as e:
+        msg = str(e)
+        if key:
+            msg = msg.replace(key, "***")
+        raise RuntimeError(msg) from None
+
+
+def workshop_page_url(wid):
+    return f"https://steamcommunity.com/sharedfiles/filedetails/?id={wid}"
+
+
+# ---- Renderer / desktop integration -----------------------------------------
 def engine_path():
     return shutil.which("linux-wallpaperengine")
 
@@ -303,8 +517,8 @@ if __name__ == "__main__" and "--apply" in sys.argv:
 # ----------------------------------------------------------------------------
 # GUI
 # ----------------------------------------------------------------------------
-from PyQt6.QtCore import Qt, QSize, QThread, QTimer, pyqtSignal  # noqa: E402
-from PyQt6.QtGui import QIcon, QImage, QPixmap  # noqa: E402
+from PyQt6.QtCore import Qt, QSize, QThread, QTimer, QUrl, pyqtSignal  # noqa: E402
+from PyQt6.QtGui import QColor, QDesktopServices, QIcon, QImage, QPixmap  # noqa: E402
 from PyQt6.QtWidgets import (  # noqa: E402
     QApplication, QCheckBox, QComboBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel,
     QLineEdit, QListView, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
@@ -312,25 +526,123 @@ from PyQt6.QtWidgets import (  # noqa: E402
 )
 
 UR = Qt.ItemDataRole.UserRole
+THUMB_W, THUMB_H = 220, 124
+CELL = QSize(240, 184)
+ITEM = QSize(232, 178)
+_placeholder = None
 
 
-class ThumbLoader(QThread):
-    loaded = pyqtSignal(int, QImage)
+def placeholder_icon():
+    global _placeholder
+    if _placeholder is None:
+        pm = QPixmap(THUMB_W, THUMB_H)
+        pm.fill(QColor(128, 128, 128, 45))
+        _placeholder = QIcon(pm)
+    return _placeholder
 
-    def __init__(self, items):
+
+def thumb(img):
+    """Scale-to-cover and centre-crop so every card has the same size."""
+    s = img.scaled(THUMB_W, THUMB_H, Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                   Qt.TransformationMode.SmoothTransformation)
+    return s.copy((s.width() - THUMB_W) // 2, (s.height() - THUMB_H) // 2, THUMB_W, THUMB_H)
+
+
+def make_grid():
+    g = QListWidget()
+    g.setViewMode(QListView.ViewMode.IconMode)
+    g.setResizeMode(QListView.ResizeMode.Adjust)
+    g.setMovement(QListView.Movement.Static)
+    g.setIconSize(QSize(THUMB_W, THUMB_H))
+    g.setGridSize(CELL)
+    g.setUniformItemSizes(False)       # sizes are set per item, see grid_item()
+    g.setWordWrap(True)
+    g.setTextElideMode(Qt.TextElideMode.ElideRight)
+    g.setSpacing(2)
+    g.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    return g
+
+
+def grid_item(text, tooltip, data):
+    li = QListWidgetItem(placeholder_icon(), text)
+    li.setSizeHint(ITEM)               # fixed size: otherwise cards collapse before thumbnails arrive
+    li.setToolTip(tooltip)
+    li.setData(UR, data)
+    return li
+
+
+class ImageLoader(QThread):
+    """Loads thumbnails from local files or URLs (cached on disk) without blocking the UI."""
+    loaded = pyqtSignal(int, int, QImage)
+
+    def __init__(self, jobs, gen):
         super().__init__()
-        self.items = items
+        self.jobs, self.gen = jobs, gen
 
     def run(self):
-        for i, it in enumerate(self.items):
-            if self.isInterruptionRequested():
+        from concurrent.futures import ThreadPoolExecutor
+
+        def work(job):
+            row, src = job
+            if self.isInterruptionRequested() or not src:
                 return
-            if not it["preview"]:
-                continue
-            img = QImage(it["preview"])
-            if img.isNull():
-                continue
-            self.loaded.emit(i, img.scaledToWidth(220, Qt.TransformationMode.SmoothTransformation))
+            try:
+                img = QImage.fromData(cached_download(src)) if src.startswith("http") else QImage(src)
+            except Exception:
+                return
+            if not img.isNull():
+                self.loaded.emit(self.gen, row, thumb(img))
+
+        with ThreadPoolExecutor(6) as ex:
+            list(ex.map(work, self.jobs))
+
+
+class SearchThread(QThread):
+    done = pyqtSignal(int, list, int, str)
+
+    def __init__(self, q, cfg, gen):
+        super().__init__()
+        self.q, self.cfg, self.gen = q, dict(cfg), gen
+
+    def run(self):
+        try:
+            items, total = search_workshop(self.q, self.cfg)
+            self.done.emit(self.gen, items, total, "")
+        except Exception as e:
+            self.done.emit(self.gen, [], 0, str(e))
+
+
+class SteamCmdThread(QThread):
+    line = pyqtSignal(str)
+    done = pyqtSignal(bool, str)
+
+    def __init__(self, exe, user, root, wid):
+        super().__init__()
+        self.exe, self.user, self.root, self.wid = exe, user, str(root), wid
+
+    def run(self):
+        cmd = [self.exe, "+force_install_dir", self.root, "+login", self.user,
+               "+workshop_download_item", WE_APPID, self.wid, "validate", "+quit"]
+        try:
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                 stdin=subprocess.DEVNULL)
+            out = []
+            for ln in p.stdout:
+                ln = ln.strip()
+                if ln:
+                    out.append(ln)
+                    self.line.emit(ln[:140])
+            p.wait()
+            text = "\n".join(out)
+            if "Success. Downloaded item" in text:
+                self.done.emit(True, "Downloaded.")
+            elif "Login Failure" in text or "FAILED" in text.upper() and "login" in text.lower():
+                self.done.emit(False, f"steamcmd couldn't log in. Run `steamcmd +login {self.user}` once in a "
+                                      "terminal to sign in (and approve Steam Guard), then try again.")
+            else:
+                self.done.emit(False, (out[-1] if out else "steamcmd produced no output"))
+        except Exception as e:
+            self.done.emit(False, str(e))
 
 
 class Main(QMainWindow):
@@ -338,16 +650,21 @@ class Main(QMainWindow):
         super().__init__()
         self.cfg = load_cfg()
         self.items = []
-        self.loader = None
+        self.ex_items = []
+        self.ex_page, self.ex_total, self.ex_gen, self.lib_gen = 1, 0, 0, 0
+        self.ex_loaded = False
+        self.threads = set()
+        self.lib_loader = self.ex_loader = None
+        self.lib_sig = ()
         self.quitting = False
         self.setWindowTitle("Wallpaper Hub")
-        self.resize(1280, 780)
+        self.resize(1320, 800)
         self.build_ui()
         self.build_tray()
         self.rescan()
         self.refresh_status()
         self.timer = QTimer(self)
-        self.timer.timeout.connect(self.refresh_status)
+        self.timer.timeout.connect(self.tick)
         self.timer.start(3000)
         if not engine_path():
             QTimer.singleShot(400, lambda: QMessageBox.warning(
@@ -355,16 +672,48 @@ class Main(QMainWindow):
                 "The renderer isn't installed, so wallpapers can't run on the desktop yet.\n\n"
                 "Install it with:  paru -S linux-wallpaperengine-git\n(or run install.sh)"))
 
+    # ---- threads ----------------------------------------------------------
+    def spawn(self, t):
+        self.threads.add(t)
+        t.finished.connect(lambda t=t: self.threads.discard(t))
+        t.start()
+        return t
+
+    def drop(self, loader):
+        if loader:
+            loader.requestInterruption()
+            try:
+                loader.loaded.disconnect()
+            except Exception:
+                pass
+
     # ---- UI ---------------------------------------------------------------
     def build_ui(self):
         split = QSplitter()
         self.setCentralWidget(split)
 
+        self.left = QTabWidget()
+        self.left.addTab(self.page_library(), "My Library")
+        self.left.addTab(self.page_explore(), "Explore Workshop")
+        self.left.currentChanged.connect(self.left_changed)
+        split.addWidget(self.left)
+
+        self.right = QTabWidget()
+        self.right.addTab(self.tab_wallpaper(), "Wallpaper")
+        self.right.addTab(self.tab_workshop_item(), "Workshop item")
+        self.right.addTab(self.tab_settings(), "Settings")
+        self.right.addTab(self.tab_lock(), "Lock screen")
+        split.addWidget(self.right)
+        split.setStretchFactor(0, 1)
+        split.setSizes([900, 400])
+
+    def page_library(self):
         left = QWidget()
         lv = QVBoxLayout(left)
         top = QHBoxLayout()
         self.search = QLineEdit()
-        self.search.setPlaceholderText("Search title, tag or workshop id…")
+        self.search.setPlaceholderText("Search your library by title, tag or workshop id…")
+        self.search.setClearButtonEnabled(True)
         self.search.textChanged.connect(self.apply_filter)
         self.typef = QComboBox()
         self.typef.addItems(["All types", "scene", "video", "web", "application"])
@@ -378,29 +727,66 @@ class Main(QMainWindow):
         top.setStretch(0, 1)
         lv.addLayout(top)
 
-        self.grid = QListWidget()
-        self.grid.setViewMode(QListView.ViewMode.IconMode)
-        self.grid.setResizeMode(QListView.ResizeMode.Adjust)
-        self.grid.setMovement(QListView.Movement.Static)
-        self.grid.setIconSize(QSize(220, 124))
-        self.grid.setGridSize(QSize(240, 172))
-        self.grid.setUniformItemSizes(True)
-        self.grid.setWordWrap(True)
-        self.grid.setSpacing(4)
+        self.grid = make_grid()
         self.grid.currentItemChanged.connect(self.show_item)
         self.grid.itemDoubleClicked.connect(lambda *_: self.apply_selected())
         lv.addWidget(self.grid, 1)
         self.count = QLabel()
         lv.addWidget(self.count)
-        split.addWidget(left)
+        return left
 
-        tabs = QTabWidget()
-        tabs.addTab(self.tab_wallpaper(), "Wallpaper")
-        tabs.addTab(self.tab_settings(), "Settings")
-        tabs.addTab(self.tab_lock(), "Lock screen")
-        split.addWidget(tabs)
-        split.setStretchFactor(0, 1)
-        split.setSizes([860, 400])
+    def page_explore(self):
+        w = QWidget()
+        v = QVBoxLayout(w)
+
+        r1 = QHBoxLayout()
+        self.ex_search = QLineEdit()
+        self.ex_search.setPlaceholderText("Search the Workshop (press Enter)…")
+        self.ex_search.setClearButtonEnabled(True)
+        self.ex_search.returnPressed.connect(lambda: self.ex_run(1))
+        b = QPushButton("Search")
+        b.clicked.connect(lambda: self.ex_run(1))
+        r1.addWidget(self.ex_search, 1)
+        r1.addWidget(b)
+        v.addLayout(r1)
+
+        r2 = QHBoxLayout()
+        self.ex_sort = QComboBox()
+        for label, val in SORTS:
+            self.ex_sort.addItem(label, val)
+        self.ex_period = QComboBox()
+        for label, val in PERIODS:
+            self.ex_period.addItem(label, val)
+        self.ex_period.setCurrentIndex(1)
+        self.ex_type = QComboBox()
+        self.ex_type.addItems(TYPES)
+        self.ex_cat = QComboBox()
+        self.ex_cat.addItems(CATEGORIES)
+        self.ex_rating = QComboBox()
+        self.ex_rating.addItems(RATINGS)
+        for c in (self.ex_sort, self.ex_period, self.ex_type, self.ex_cat, self.ex_rating):
+            c.currentIndexChanged.connect(self.ex_filter_changed)
+            r2.addWidget(c)
+        v.addLayout(r2)
+
+        self.ex_grid = make_grid()
+        self.ex_grid.currentItemChanged.connect(self.show_ex_item)
+        self.ex_grid.itemDoubleClicked.connect(lambda *_: self.subscribe())
+        v.addWidget(self.ex_grid, 1)
+
+        r3 = QHBoxLayout()
+        self.ex_prev = QPushButton("◀ Prev")
+        self.ex_prev.clicked.connect(lambda: self.ex_run(self.ex_page - 1))
+        self.ex_next = QPushButton("Next ▶")
+        self.ex_next.clicked.connect(lambda: self.ex_run(self.ex_page + 1))
+        self.ex_label = QLabel("")
+        r3.addWidget(self.ex_prev)
+        r3.addWidget(self.ex_next)
+        r3.addWidget(self.ex_label, 1)
+        v.addLayout(r3)
+        self.ex_prev.setEnabled(False)
+        self.ex_next.setEnabled(False)
+        return w
 
     def tab_wallpaper(self):
         w = QWidget()
@@ -443,6 +829,40 @@ class Main(QMainWindow):
         self.status.setWordWrap(True)
         v.addWidget(self.status)
         v.addStretch(1)
+        return w
+
+    def tab_workshop_item(self):
+        w = QWidget()
+        v = QVBoxLayout(w)
+        self.ex_preview = QLabel("Pick a wallpaper in “Explore Workshop”")
+        self.ex_preview.setMinimumSize(340, 192)
+        self.ex_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.ex_preview.setStyleSheet("background: rgba(128,128,128,40); border-radius: 6px;")
+        self.ex_title = QLabel("")
+        self.ex_title.setWordWrap(True)
+        self.ex_title.setStyleSheet("font-size: 16px; font-weight: bold;")
+        self.ex_meta = QLabel("")
+        self.ex_meta.setWordWrap(True)
+        self.ex_desc = QLabel("")
+        self.ex_desc.setWordWrap(True)
+        self.ex_desc.setAlignment(Qt.AlignmentFlag.AlignTop)
+        for x in (self.ex_preview, self.ex_title, self.ex_meta, self.ex_desc):
+            v.addWidget(x)
+        self.b_sub = QPushButton("Subscribe in Steam")
+        self.b_sub.clicked.connect(self.subscribe)
+        self.b_dl = QPushButton("Download directly (steamcmd)")
+        self.b_dl.clicked.connect(self.download_direct)
+        self.b_web = QPushButton("Open Workshop page in browser")
+        self.b_web.clicked.connect(lambda: self.open_web())
+        self.b_show = QPushButton("Show in My Library")
+        self.b_show.clicked.connect(self.show_in_library)
+        for b in (self.b_sub, self.b_dl, self.b_web, self.b_show):
+            v.addWidget(b)
+        self.ex_status = QLabel("")
+        self.ex_status.setWordWrap(True)
+        v.addWidget(self.ex_status)
+        v.addStretch(1)
+        self.update_dl_button()
         return w
 
     def tab_settings(self):
@@ -500,6 +920,22 @@ class Main(QMainWindow):
         b = QPushButton("Restart wallpaper with these settings")
         b.clicked.connect(self.restart_clicked)
         f.addRow(b)
+
+        f.addRow(QLabel("<b>Workshop (Explore)</b>"))
+        self.api_key = QLineEdit(c["steam_api_key"])
+        self.api_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.api_key.setPlaceholderText("optional – makes Explore more reliable")
+        self.api_key.editingFinished.connect(lambda: self.setc("steam_api_key", self.api_key.text().strip()))
+        f.addRow("Steam Web API key", self.api_key)
+        link = QLabel('<a href="https://steamcommunity.com/dev/apikey">Get a free key</a> '
+                      "(any domain name works). Without one, Explore reads the Workshop web pages.")
+        link.setOpenExternalLinks(True)
+        link.setWordWrap(True)
+        f.addRow(link)
+        self.cmd_user = QLineEdit(c["steamcmd_user"])
+        self.cmd_user.setPlaceholderText("optional – Steam username that owns Wallpaper Engine")
+        self.cmd_user.editingFinished.connect(self.cmd_user_changed)
+        f.addRow("steamcmd username", self.cmd_user)
 
         self.info = QLabel("")
         self.info.setWordWrap(True)
@@ -573,26 +1009,36 @@ class Main(QMainWindow):
         else:
             QMessageBox.warning(self, "Wallpaper Hub", msg)
 
+    def left_changed(self, i):
+        self.right.setCurrentIndex(1 if i == 1 else 0)
+        if i == 1 and not self.ex_loaded:
+            self.ex_run(1)
+
     # ---- library ----------------------------------------------------------
     def rescan(self):
-        if self.loader:
-            self.loader.requestInterruption()
-            self.loader.wait()
+        keep = self.current()["id"] if self.current() else None
         paths, _ = library_info(self.cfg)
+        self.lib_sig = library_signature(paths)
         self.items = scan(paths)
+        self.lib_gen += 1
+        self.drop(self.lib_loader)
         self.grid.clear()
         for i, it in enumerate(self.items):
-            li = QListWidgetItem(it["title"])
-            li.setData(UR, i)
-            li.setToolTip(f"{it['title']}\n{it['type']} · {it['id']}")
-            self.grid.addItem(li)
-        self.loader = ThumbLoader(self.items)
-        self.loader.loaded.connect(lambda i, img: self.grid.item(i).setIcon(QIcon(QPixmap.fromImage(img))))
-        self.loader.start()
+            self.grid.addItem(grid_item(it["title"], f"{it['title']}\n{it['type']} · {it['id']}", i))
+            if keep and it["id"] == keep:
+                self.grid.setCurrentRow(i)
+        self.lib_loader = ImageLoader([(i, it["preview"]) for i, it in enumerate(self.items)], self.lib_gen)
+        self.lib_loader.loaded.connect(self.on_lib_thumb)
+        self.spawn(self.lib_loader)
         self.apply_filter()
+        self.refresh_ex_marks()
         if not self.items:
-            self.count.setText("No wallpapers found. Subscribe to some in Steam (Wallpaper Engine) "
+            self.count.setText("No wallpapers found. Subscribe to some in the Explore tab, in Steam, "
                                "or use “Add folder…”.")
+
+    def on_lib_thumb(self, gen, row, img):
+        if gen == self.lib_gen and row < self.grid.count():
+            self.grid.item(row).setIcon(QIcon(QPixmap.fromImage(img)))
 
     def add_library(self):
         d = QFileDialog.getExistingDirectory(self, "Folder containing wallpaper project folders")
@@ -629,6 +1075,147 @@ class Main(QMainWindow):
                           if it["type"] == "application" else
                           "Web wallpapers have only partial support in linux-wallpaperengine."
                           if it["type"] == "web" else "")
+
+    # ---- explore ----------------------------------------------------------
+    def ex_query(self, page):
+        return {
+            "text": self.ex_search.text(), "page": page,
+            "sort": self.ex_sort.currentData(), "days": self.ex_period.currentData(),
+            "type": self.ex_type.currentText(), "category": self.ex_cat.currentText(),
+            "rating": self.ex_rating.currentText(),
+        }
+
+    def ex_filter_changed(self, *_):
+        self.ex_period.setEnabled(self.ex_sort.currentData() == "trend")
+        if self.ex_loaded:
+            self.ex_run(1)
+
+    def ex_run(self, page):
+        if page < 1:
+            return
+        self.ex_loaded = True
+        self.ex_gen += 1
+        self.drop(self.ex_loader)
+        self.ex_page = page
+        self.ex_label.setText("Loading…")
+        self.ex_prev.setEnabled(False)
+        self.ex_next.setEnabled(False)
+        t = SearchThread(self.ex_query(page), self.cfg, self.ex_gen)
+        t.done.connect(self.ex_results)
+        self.spawn(t)
+
+    def ex_results(self, gen, items, total, err):
+        if gen != self.ex_gen:
+            return
+        self.ex_items, self.ex_total = items, total
+        self.ex_grid.clear()
+        have = {it["id"] for it in self.items}
+        for i, it in enumerate(items):
+            mark = "✓ " if it["id"] in have else ""
+            self.ex_grid.addItem(grid_item(mark + it["title"], f"{it['title']}\n{it['author']}".strip(), i))
+        pages = max(1, min(1000, math.ceil(total / PER_PAGE))) if total else 1
+        if err:
+            self.ex_label.setText(f"Couldn't reach the Workshop: {err}")
+        elif not items:
+            self.ex_label.setText("No results. If this keeps happening, add a Steam Web API key in Settings.")
+        else:
+            self.ex_label.setText(f"Page {self.ex_page} of {pages} · {total:,} wallpapers")
+        self.ex_prev.setEnabled(self.ex_page > 1)
+        self.ex_next.setEnabled(bool(items) and self.ex_page < pages)
+        self.ex_loader = ImageLoader([(i, it["preview_url"]) for i, it in enumerate(items)], self.ex_gen)
+        self.ex_loader.loaded.connect(self.on_ex_thumb)
+        self.spawn(self.ex_loader)
+
+    def on_ex_thumb(self, gen, row, img):
+        if gen == self.ex_gen and row < self.ex_grid.count():
+            self.ex_grid.item(row).setIcon(QIcon(QPixmap.fromImage(img)))
+
+    def refresh_ex_marks(self):
+        have = {it["id"] for it in self.items}
+        for i, it in enumerate(self.ex_items):
+            if i < self.ex_grid.count():
+                self.ex_grid.item(i).setText(("✓ " if it["id"] in have else "") + it["title"])
+        self.show_ex_item()
+
+    def ex_current(self):
+        li = self.ex_grid.currentItem()
+        return self.ex_items[li.data(UR)] if li and li.data(UR) < len(self.ex_items) else None
+
+    def show_ex_item(self, *_):
+        it = self.ex_current()
+        if not it:
+            return
+        have = {x["id"] for x in self.items}
+        pm = QPixmap(str(cache_file(it["preview_url"]))) if it["preview_url"] else QPixmap()
+        if pm.isNull():
+            self.ex_preview.setText("Loading preview…")
+        else:
+            self.ex_preview.setPixmap(pm.scaled(340, 192, Qt.AspectRatioMode.KeepAspectRatio,
+                                                Qt.TransformationMode.SmoothTransformation))
+        self.ex_title.setText(it["title"])
+        bits = [b for b in (f"by {it['author']}" if it["author"] else "",
+                            f"{it['subs']:,} subscribers" if it["subs"] else "", it["id"]) if b]
+        self.ex_meta.setText(" · ".join(bits) + (f"\n{', '.join(it['tags'])}" if it["tags"] else ""))
+        self.ex_desc.setText(it["desc"])
+        installed = it["id"] in have
+        self.b_show.setVisible(installed)
+        self.b_sub.setText("Already in your library — re-open in Steam" if installed else "Subscribe in Steam")
+        self.ex_status.setText("✓ Installed" if installed else "")
+        self.right.setCurrentIndex(1)
+
+    def subscribe(self):
+        it = self.ex_current()
+        if not it:
+            return
+        if not QDesktopServices.openUrl(QUrl(f"steam://url/CommunityFilePage/{it['id']}")):
+            self.open_web()
+            return
+        self.ex_status.setText("Opened in Steam. Press Subscribe there; Steam downloads it and it will "
+                               "show up in My Library automatically.")
+
+    def open_web(self):
+        it = self.ex_current()
+        if it:
+            QDesktopServices.openUrl(QUrl(workshop_page_url(it["id"])))
+
+    def show_in_library(self):
+        it = self.ex_current()
+        if not it:
+            return
+        for i, x in enumerate(self.items):
+            if x["id"] == it["id"]:
+                self.left.setCurrentIndex(0)
+                self.search.clear()
+                self.grid.setCurrentRow(i)
+                self.grid.scrollToItem(self.grid.item(i))
+                return
+
+    def update_dl_button(self):
+        exe = shutil.which("steamcmd")
+        user = self.cfg.get("steamcmd_user", "").strip()
+        self.b_dl.setEnabled(bool(exe and user))
+        self.b_dl.setToolTip("" if exe and user else
+                             "Needs steamcmd installed and a steamcmd username set in Settings "
+                             "(sign in once with `steamcmd +login <user>` in a terminal).")
+
+    def cmd_user_changed(self):
+        self.setc("steamcmd_user", self.cmd_user.text().strip())
+        self.update_dl_button()
+
+    def download_direct(self):
+        it = self.ex_current()
+        exe = shutil.which("steamcmd")
+        dirs = steam_apps_dirs()
+        if not (it and exe and dirs):
+            self.ex_status.setText("steamcmd or your Steam library folder wasn't found.")
+            return
+        t = SteamCmdThread(exe, self.cfg["steamcmd_user"].strip(), dirs[0].parent, it["id"])
+        t.line.connect(lambda s: self.ex_status.setText(s))
+        t.done.connect(lambda ok, msg: (self.ex_status.setText(msg), self.rescan() if ok else None))
+        self.b_dl.setEnabled(False)
+        t.finished.connect(self.update_dl_button)
+        self.ex_status.setText("Starting steamcmd…")
+        self.spawn(t)
 
     # ---- actions ----------------------------------------------------------
     def apply_selected(self):
@@ -685,6 +1272,12 @@ class Main(QMainWindow):
         self.setc("autostart", on)
         set_autostart(on)
 
+    def tick(self):
+        paths, _ = library_info(self.cfg)
+        if library_signature(paths) != self.lib_sig:     # a Workshop download finished (or was removed)
+            self.rescan()
+        self.refresh_status()
+
     def refresh_status(self):
         pid = engine_pid()
         by_dir = {it["dir"]: it["title"] for it in self.items}
@@ -694,15 +1287,17 @@ class Main(QMainWindow):
         self.status.setText("\n".join(lines))
         paths, assets = library_info(self.cfg)
         self.info.setText(f"Renderer: {engine_path() or 'NOT INSTALLED'}\n"
+                          f"steamcmd: {shutil.which('steamcmd') or 'not installed (optional)'}\n"
                           f"Assets: {assets or 'not found'}\nLibraries: {', '.join(paths) or 'none found'}\n"
                           f"Log: {LOG_FILE}")
 
     # ---- lifecycle --------------------------------------------------------
     def quit_app(self):
         self.quitting = True
-        if self.loader:
-            self.loader.requestInterruption()
-            self.loader.wait()
+        for l in (self.lib_loader, self.ex_loader):
+            self.drop(l)
+        for t in list(self.threads):
+            t.wait(1500)
         QApplication.quit()
 
     def closeEvent(self, e):

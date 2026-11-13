@@ -12,6 +12,17 @@ Installs `python-pyqt6`, the renderer `linux-wallpaperengine-git` (AUR), and a "
 - Wallpaper Engine owned and installed in Steam (needed for the assets folder).
 - Wallpapers subscribed in the Steam Workshop (they download to `steamapps/workshop/content/431960`).
 
+## Explore the Workshop
+The **Explore Workshop** tab browses the whole Wallpaper Engine Workshop from inside the app: search, sort
+(trending / most popular / most recent / recently updated), time period, type, category, rating and paging.
+Wallpapers you already have show a ✓.
+- **Subscribe in Steam** opens the item in your Steam client; press Subscribe there and Steam downloads it.
+  It appears in **My Library** automatically once the download finishes.
+- **Download directly (steamcmd)** is optional: install `steamcmd`, sign in once in a terminal
+  (`steamcmd +login YOURUSER`), then enter the username in Settings.
+- Settings has an optional **Steam Web API key** ([free](https://steamcommunity.com/dev/apikey)). With one,
+  Explore uses Steam's official API; without one it reads the Workshop web pages, which Steam can change.
+
 ## Use
 - Pick a wallpaper, choose a screen (or all), click **Apply to desktop (animated)**. Double-click also applies.
 - **Settings** tab: FPS, volume/mute, scaling, pause on fullscreen, mouse/parallax, re-apply on login.
