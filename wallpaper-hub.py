@@ -35,7 +35,7 @@ CFG_FILE = CFG_DIR / "config.json"
 PID_FILE = DATA_DIR / "engine.pid"
 LOG_FILE = DATA_DIR / "engine.log"
 AUTOSTART = Path.home() / ".config/autostart/wallpaper-hub.desktop"
-__version__ = "1.3.4"
+__version__ = "1.3.5"
 PLUGIN_ID = "com.github.catsout.wallpaperEngineKde"   # Wallpaper Engine for KDE (Plasma wallpaper plugin)
 REPO = "Blake-McCullough/wallpaper-hub"
 SCRIPT = Path(os.path.realpath(__file__))
@@ -612,6 +612,26 @@ def plan_for(it, cfg):
                       "Install wallpaper-engine-kde-plugin-git for animation.")
 
 
+def kde_each(geo, body):
+    """Plasma script that runs `body` (where `d` is a desktop) on the desktop of one monitor, or on every desktop
+    when geo is None. geo = (x, y, w, h, connector_name). The monitor is found by its connector name (Plasma's
+    screenForConnector) and, if that isn't available, by the nearest centre, which survives Qt and Plasma
+    disagreeing by a pixel."""
+    if geo:
+        name = json.dumps(geo[4]) if len(geo) > 4 else "\"\""
+        target = "{cx:%s,cy:%s}" % (geo[0] + geo[2] / 2, geo[1] + geo[3] / 2)
+    else:
+        name, target = "\"\"", "null"
+    return ("var T=" + target + ";var N=" + name + ";"
+            "var bn=(N&&typeof screenForConnector==='function')?screenForConnector(N):-1;"
+            "var ds=desktops();var L=[];var min=1e18;"
+            "for(var i=0;i<ds.length;i++){var s=ds[i].screen;if(s<0)continue;var g=screenGeometry(s);"
+            "var dist=!T?0:(bn>=0?(s==bn?0:1e12):Math.pow(g.x+g.width/2-T.cx,2)+Math.pow(g.y+g.height/2-T.cy,2));"
+            "L.push([ds[i],dist]);if(dist<min)min=dist;}"
+            "var n=0;for(var k=0;k<L.length;k++){if(L[k][1]<=min+1){var d=L[k][0];" + body + "n++;}}"
+            "n>0?\"ok\":\"nomatch\";")
+
+
 def kde_eval(js):
     qd = shutil.which("qdbus6") or shutil.which("qdbus") or shutil.which("qdbus-qt6")
     if not qd:
@@ -630,16 +650,14 @@ def kde_apply_plugin(wdir, geo=None, scaling="default"):
         return False, ("The Wallpaper Engine plugin for Plasma isn't installed.\n\n"
                        "Install it with:  paru -S wallpaper-engine-kde-plugin-git\n"
                        "then restart Plasma (log out and in).")
-    cond = "true" if not geo else "(g.x==%d&&g.y==%d&&g.width==%d&&g.height==%d)" % tuple(geo)
     src, lib, wid = plugin_values(wdir)
-    js = ("var found=false;var ds=desktops();for(var i=0;i<ds.length;i++){var d=ds[i];var g=screenGeometry(d.screen);"
-          "if(" + cond + "){d.wallpaperPlugin=" + json.dumps(PLUGIN_ID) + ";"
-          "d.currentConfigGroup=[\"Wallpaper\"," + json.dumps(PLUGIN_ID) + ",\"General\"];"
-          "d.writeConfig(\"SteamLibraryPath\"," + json.dumps(lib) + ");"
-          "d.writeConfig(\"WallpaperSource\"," + json.dumps(src) + ");"
-          "d.writeConfig(\"WallpaperWorkShopId\"," + json.dumps(wid) + ");"
-          "d.reloadConfig();found=true;}}found?\"ok\":\"nomatch\";")
-    return kde_eval(js)
+    body = ("d.wallpaperPlugin=" + json.dumps(PLUGIN_ID) + ";"
+            "d.currentConfigGroup=[\"Wallpaper\"," + json.dumps(PLUGIN_ID) + ",\"General\"];"
+            "d.writeConfig(\"SteamLibraryPath\"," + json.dumps(lib) + ");"
+            "d.writeConfig(\"WallpaperSource\"," + json.dumps(src) + ");"
+            "d.writeConfig(\"WallpaperWorkShopId\"," + json.dumps(wid) + ");"
+            "d.reloadConfig();")
+    return kde_eval(kde_each(geo, body))
 
 
 def plugin_values(wdir):
@@ -744,14 +762,10 @@ def desktop_env():
 def kde_set_on_screen(path, geo=None):
     """Set Plasma's normal picture wallpaper on one monitor (geo = x, y, w, h) or on all of them.
     Also switches the monitor away from the animated Wallpaper Engine plugin."""
-    cond = "true" if not geo else "(g.x==%d&&g.y==%d&&g.width==%d&&g.height==%d)" % tuple(geo)
-    js = ("var uri=" + json.dumps(Path(path).as_uri()) + ";var found=false;var ds=desktops();"
-          "for(var i=0;i<ds.length;i++){var d=ds[i];var g=screenGeometry(d.screen);"
-          "if(" + cond + "){d.wallpaperPlugin=\"org.kde.image\";"
-          "d.currentConfigGroup=[\"Wallpaper\",\"org.kde.image\",\"General\"];"
-          "d.writeConfig(\"Image\",uri);d.reloadConfig();found=true;}}"
-          "found?\"ok\":\"nomatch\";")
-    return kde_eval(js)
+    body = ("d.wallpaperPlugin=\"org.kde.image\";"
+            "d.currentConfigGroup=[\"Wallpaper\",\"org.kde.image\",\"General\"];"
+            "d.writeConfig(\"Image\"," + json.dumps(Path(path).as_uri()) + ");d.reloadConfig();")
+    return kde_eval(kde_each(geo, body))
 
 
 def set_static_desktop(path, geo=None):
@@ -2179,7 +2193,7 @@ class Main(QMainWindow):
             stop_engine()                       # no stray renderer fighting with Plasma
             scr = next((s for s in QApplication.screens() if s.name() == target), None)
             g = scr.geometry() if (scr and target != "*") else None
-            ok, msg = kde_apply_plugin(it["dir"], (g.x(), g.y(), g.width(), g.height()) if g else None, scaling)
+            ok, msg = kde_apply_plugin(it["dir"], (g.x(), g.y(), g.width(), g.height(), scr.name()) if g else None, scaling)
             self.report(ok, msg, f"Applied “{it['title']}” to {where} through Plasma")
             self.apply_hint.setText("")
         else:
@@ -2196,7 +2210,7 @@ class Main(QMainWindow):
         if not png:
             return QMessageBox.warning(self, "Wallpaper Hub", "This wallpaper has no usable image.")
         g = scr.geometry() if scr else None
-        ok, msg = set_static_desktop(png, (g.x(), g.y(), g.width(), g.height()) if g else None)
+        ok, msg = set_static_desktop(png, (g.x(), g.y(), g.width(), g.height(), scr.name()) if g else None)
         self.report(ok, msg, f"Set “{it['title']}” on {scr.name() if scr else 'all screens'}. {note}")
         self.apply_hint.setText(note if ok else "")
         self.refresh_status()
@@ -2223,7 +2237,7 @@ class Main(QMainWindow):
             for scr_name, wdir in self.cfg["assignments"].items():
                 scr = next((s for s in QApplication.screens() if s.name() == scr_name), None)
                 g = scr.geometry() if scr else None
-                ok, msg = kde_apply_plugin(wdir, (g.x(), g.y(), g.width(), g.height()) if g else None,
+                ok, msg = kde_apply_plugin(wdir, (g.x(), g.y(), g.width(), g.height(), scr.name()) if g else None,
                                            self.cfg["screen_scaling"].get(scr_name, self.cfg["scaling"]))
                 if not ok:
                     break
@@ -2248,7 +2262,7 @@ class Main(QMainWindow):
         if not png:
             return QMessageBox.warning(self, "Wallpaper Hub", "This wallpaper has no usable preview image.")
         g = scr.geometry() if scr else None
-        ok, msg = set_static_desktop(png, (g.x(), g.y(), g.width(), g.height()) if g else None)
+        ok, msg = set_static_desktop(png, (g.x(), g.y(), g.width(), g.height(), scr.name()) if g else None)
         self.report(ok, msg, f"Static desktop image set on {scr.name() if scr else 'all screens'} "
                              "(stop the animated wallpaper to see it)")
 
