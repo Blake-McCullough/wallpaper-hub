@@ -14,10 +14,13 @@ import json
 import math
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
 import sys
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -31,7 +34,10 @@ CFG_FILE = CFG_DIR / "config.json"
 PID_FILE = DATA_DIR / "engine.pid"
 LOG_FILE = DATA_DIR / "engine.log"
 AUTOSTART = Path.home() / ".config/autostart/wallpaper-hub.desktop"
-UA = "Mozilla/5.0 (X11; Linux x86_64) WallpaperHub/1.1"
+__version__ = "1.2.0"
+REPO = "Blake-McCullough/wallpaper-hub"
+SCRIPT = Path(os.path.realpath(__file__))
+UA = f"Mozilla/5.0 (X11; Linux x86_64) WallpaperHub/{__version__}"
 PER_PAGE = 30
 
 DEFAULTS = {
@@ -46,9 +52,13 @@ DEFAULTS = {
     "pause_fullscreen": True,
     "disable_mouse": False,
     "disable_parallax": False,
-    "scaling": "default",
+    "scaling": "default",       # default scaling mode for monitors without their own setting
+    "screen_scaling": {},       # monitor name -> default / fill / fit / stretch
+    "layout": "independent",    # independent: a wallpaper per monitor, duplicate: same one on every monitor
     "clamp": "clamp",
     "autostart": False,
+    "check_updates": True,
+    "cfg_version": 3,
     "ex_include": ["Everyone"], # Explore: tags a wallpaper must have
     "ex_exclude": [],           # Explore: tags a wallpaper must NOT have (e.g. "Anime")
     "steam_api_key": "",        # optional: makes Explore far more reliable
@@ -81,9 +91,13 @@ API_TEXT_SEARCH = 12
 def load_cfg():
     cfg = dict(DEFAULTS)
     try:
-        cfg.update(json.loads(CFG_FILE.read_text()))
+        saved = json.loads(CFG_FILE.read_text())
+        if saved.get("cfg_version", 1) < 3 and saved.get("scaling") == "fill":
+            saved["scaling"] = "default"    # 1.1 briefly defaulted to "fill"; Wallpaper Engine's default mode is "default"
+        cfg.update(saved)
     except Exception:
         pass
+    cfg["cfg_version"] = 3
     return cfg
 
 
@@ -361,40 +375,167 @@ def workshop_page_url(wid):
     return f"https://steamcommunity.com/sharedfiles/filedetails/?id={wid}"
 
 
+# ---- Self update from GitHub releases ----------------------------------------
+def parse_version(s):
+    return tuple(int(x) for x in re.findall(r"\d+", str(s))[:4]) or (0,)
+
+
+def latest_release():
+    try:
+        data = json.loads(http_get(f"https://api.github.com/repos/{REPO}/releases/latest").decode())
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            raise RuntimeError("No release found (is the GitHub repo public and does it have a release?)") from None
+        raise RuntimeError(f"GitHub said {e.code}") from None
+    return {
+        "version": str(data.get("tag_name", "")).lstrip("vV"),
+        "notes": data.get("body") or "",
+        "url": data.get("html_url", ""),
+        "assets": {a["name"]: a["browser_download_url"] for a in data.get("assets", [])},
+    }
+
+
+def update_blocker():
+    """Why this copy of the app can't update itself, or '' if it can."""
+    if (SCRIPT.parent / ".git").exists():
+        return "Running from a git checkout: update with `git pull` instead."
+    if not os.access(SCRIPT.parent, os.W_OK):
+        return f"{SCRIPT.parent} isn't writable: re-run install.sh from the new release."
+    return ""
+
+
+def install_update(rel):
+    """Download the release's wallpaper-hub.py, verify it, and replace the running script."""
+    why = update_blocker()
+    if why:
+        raise RuntimeError(why)
+    url = rel["assets"].get("wallpaper-hub.py")
+    if not url:
+        raise RuntimeError("That release has no wallpaper-hub.py file attached.")
+    data = http_get(url, timeout=60)
+    sha_url = rel["assets"].get("wallpaper-hub.py.sha256")
+    if sha_url:
+        want = http_get(sha_url).decode().split()[0].lower()
+        if hashlib.sha256(data).hexdigest() != want:
+            raise RuntimeError("Checksum mismatch, update aborted.")
+    compile(data, "wallpaper-hub.py", "exec")           # refuse a file that doesn't even parse
+    m = re.search(rb'^__version__ = "([^"]+)"', data, re.M)
+    if not m or parse_version(m.group(1).decode()) < parse_version(__version__):
+        raise RuntimeError("Downloaded file isn't a newer Wallpaper Hub.")
+    tmp = SCRIPT.with_name(SCRIPT.name + ".new")
+    tmp.write_bytes(data)
+    tmp.chmod(0o755)
+    try:
+        shutil.copy2(SCRIPT, SCRIPT.with_name(SCRIPT.name + ".bak"))
+    except Exception:
+        pass
+    os.replace(tmp, SCRIPT)
+    return m.group(1).decode()
+
+
 # ---- Renderer / desktop integration -----------------------------------------
 def engine_path():
     return shutil.which("linux-wallpaperengine")
+
+
+_flags_cache = {}
+
+
+def engine_flags():
+    """Options the installed linux-wallpaperengine understands (its CLI changes between versions)."""
+    exe = engine_path()
+    if not exe:
+        return set()
+    if exe not in _flags_cache:
+        try:
+            r = subprocess.run([exe, "--help"], capture_output=True, text=True, timeout=10)
+            _flags_cache[exe] = set(re.findall(r"--[a-z][a-z0-9-]*", r.stdout + r.stderr))
+        except Exception:
+            _flags_cache[exe] = set()
+    return _flags_cache[exe]
 
 
 def build_command(cfg):
     exe = engine_path()
     if not exe or not cfg["assignments"]:
         return None
+    flags = engine_flags()
     _, assets = library_info(cfg)
-    cmd = [exe, "--fps", str(cfg["fps"])]
+    cmd = [exe]
+
+    def has(flag):
+        return not flags or flag in flags      # unknown help output: be permissive
+
+    def opt(flag, *args):
+        if has(flag):
+            cmd.extend([flag, *map(str, args)])
+
+    opt("--fps", cfg["fps"])
     if cfg["mute"]:
-        cmd.append("--silent")
+        opt("--silent")
     else:
-        cmd += ["--volume", str(cfg["volume"])]
+        opt("--volume", cfg["volume"])
     if cfg["noautomute"]:
-        cmd.append("--noautomute")
+        opt("--noautomute")
     if cfg["no_audio_processing"]:
-        cmd.append("--no-audio-processing")
+        opt("--no-audio-processing")
     if not cfg["pause_fullscreen"]:
-        cmd.append("--no-fullscreen-pause")
+        opt("--no-fullscreen-pause")
     if cfg["disable_mouse"]:
-        cmd.append("--disable-mouse")
+        opt("--disable-mouse")
     if cfg["disable_parallax"]:
-        cmd.append("--disable-parallax")
+        opt("--disable-parallax")
     if assets:
-        cmd += ["--assets-dir", assets]
-    for screen, wdir in cfg["assignments"].items():
-        cmd += ["--screen-root", screen, "--bg", wdir]
-        if cfg["scaling"] != "default":
-            cmd += ["--scaling", cfg["scaling"]]
+        opt("--assets-dir", assets)
+
+    def scaling_of(screen):
+        return cfg.get("screen_scaling", {}).get(screen, cfg["scaling"])
+
+    def per_screen_opts(screen):
+        if scaling_of(screen) != "default":
+            opt("--scaling", scaling_of(screen))
         if cfg["clamp"] != "clamp":
-            cmd += ["--clamp", cfg["clamp"]]
+            opt("--clamp", cfg["clamp"])
+
+    if has("--bg"):
+        for screen, wdir in cfg["assignments"].items():
+            cmd += ["--screen-root", screen, "--bg", wdir]
+            per_screen_opts(screen)
+    else:   # older builds: one wallpaper shared by all listed screens, given as the last argument
+        first = next(iter(cfg["assignments"]))
+        for screen in cfg["assignments"]:
+            cmd += ["--screen-root", screen]
+        per_screen_opts(first)
+        cmd.append(cfg["assignments"][first])
     return cmd
+
+
+def log_tail(n=15):
+    try:
+        return "\n".join(LOG_FILE.read_text(errors="replace").splitlines()[-n:])
+    except Exception:
+        return ""
+
+
+def session_hint():
+    if os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland" and "kde" in desktop_env():
+        return ("You're on Plasma (Wayland). If the wallpaper runs but you can't see it, Plasma's own wallpaper "
+                "may be drawn over it; the reliable fix is logging out and choosing “Plasma (X11)” at the login screen.")
+    return ""
+
+
+def diagnostics():
+    cmd = build_command(load_cfg())
+    lines = [f"Session: {os.environ.get('XDG_SESSION_TYPE', '?')}   Desktop: {os.environ.get('XDG_CURRENT_DESKTOP', '?')}",
+             f"Renderer: {engine_path() or 'not installed'}",
+             f"Options it supports: {' '.join(sorted(engine_flags())) or 'unknown'}",
+             "Command: " + (shlex.join(cmd) if cmd else "(no wallpaper assigned yet)"), "",
+             "--- engine.log (last 80 lines) ---"]
+    try:
+        lines += LOG_FILE.read_text(errors="replace").splitlines()[-80:]
+    except Exception:
+        lines.append("(no log yet)")
+    return "\n".join(lines)
 
 
 def engine_pid():
@@ -433,10 +574,19 @@ def start_engine(cfg):
     stop_engine()
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     log = open(LOG_FILE, "w")
-    log.write("$ " + " ".join(cmd) + "\n")
+    log.write("$ " + shlex.join(cmd) + "\n")
     log.flush()
     p = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+    log.close()
     PID_FILE.write_text(str(p.pid))
+    time.sleep(1.5)
+    if p.poll() is not None:        # crashed straight away: show why instead of silently doing nothing
+        try:
+            PID_FILE.unlink()
+        except Exception:
+            pass
+        return False, ("linux-wallpaperengine exited immediately.\n\n" + log_tail(14) +
+                       "\n\n(Settings → “Show engine log” has the full command and log.)")
     return True, f"Started (pid {p.pid}). Log: {LOG_FILE}"
 
 
@@ -452,25 +602,51 @@ def desktop_env():
     return os.environ.get("XDG_CURRENT_DESKTOP", "").lower()
 
 
-def set_static_desktop(path):
+def kde_set_on_screen(path, geo):
+    """Set the Plasma wallpaper of ONE monitor, found by its geometry (x, y, w, h)."""
+    x, y, w, h = geo
+    qd = shutil.which("qdbus6") or shutil.which("qdbus") or shutil.which("qdbus-qt6")
+    if not qd:
+        return False, "qdbus6 not found (needed to target a single monitor on Plasma)."
+    js = (
+        f'var uri="{Path(path).as_uri()}"; var found=false; var ds=desktops();'
+        "for (var i=0;i<ds.length;i++){var d=ds[i]; var g=screenGeometry(d.screen);"
+        f"if(g.x=={x}&&g.y=={y}&&g.width=={w}&&g.height=={h}){{"
+        'd.wallpaperPlugin="org.kde.image"; d.currentConfigGroup=["Wallpaper","org.kde.image","General"];'
+        'd.writeConfig("Image",uri); d.reloadConfig(); found=true;}}}'
+        'found ? "ok" : "nomatch";'
+    )
+    ok, out = run([qd, "org.kde.plasmashell", "/PlasmaShell", "org.kde.PlasmaShell.evaluateScript", js])
+    if not ok:
+        return False, out or "Plasma didn't accept the request."
+    if "nomatch" in out:
+        return False, "Couldn't match that monitor in Plasma."
+    return True, "ok"
+
+
+def set_static_desktop(path, geo=None):
+    """geo=(x, y, w, h) targets one monitor (Plasma only); None sets every monitor."""
     de = desktop_env()
     uri = Path(path).as_uri()
     if "kde" in de:
+        if geo:
+            return kde_set_on_screen(path, geo)
         tool = shutil.which("plasma-apply-wallpaperimage")
         if not tool:
             return False, "plasma-apply-wallpaperimage not found."
         return run([tool, path])
+    note = " (this desktop only supports one image for all monitors)" if geo else ""
     if "gnome" in de or "cinnamon" in de or "budgie" in de:
         ok1, m1 = run(["gsettings", "set", "org.gnome.desktop.background", "picture-uri", uri])
         ok2, m2 = run(["gsettings", "set", "org.gnome.desktop.background", "picture-uri-dark", uri])
-        return ok1 and ok2, (m1 + m2).strip()
+        return ok1 and ok2, (m1 + m2).strip() or "ok" + note
     if "xfce" in de:
         ok, out = run(["xfconf-query", "-c", "xfce4-desktop", "-l"])
         if not ok:
             return False, out
         for prop in [l for l in out.splitlines() if l.endswith("last-image")]:
             run(["xfconf-query", "-c", "xfce4-desktop", "-p", prop, "-s", path])
-        return True, "ok"
+        return True, "ok" + note
     return False, f"Static wallpaper isn't wired up for desktop '{de or 'unknown'}'."
 
 
@@ -525,7 +701,7 @@ if __name__ == "__main__" and "--apply" in sys.argv:
 # ----------------------------------------------------------------------------
 # GUI
 # ----------------------------------------------------------------------------
-from PyQt6.QtCore import Qt, QSize, QThread, QTimer, QUrl, pyqtSignal  # noqa: E402
+from PyQt6.QtCore import QObject, Qt, QSize, QThread, QTimer, QUrl, pyqtSignal  # noqa: E402
 from PyQt6.QtGui import QColor, QDesktopServices, QIcon, QImage, QPixmap  # noqa: E402
 from PyQt6.QtWidgets import (  # noqa: E402
     QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout, QGridLayout, QGroupBox,
@@ -534,6 +710,14 @@ from PyQt6.QtWidgets import (  # noqa: E402
     QVBoxLayout, QWidget,
 )
 
+try:    # optional: lets the app sign in to Steam's website so it can subscribe to Workshop items for you
+    from PyQt6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile  # noqa: E402
+    from PyQt6.QtWebEngineWidgets import QWebEngineView  # noqa: E402
+    HAVE_WEB = True
+except Exception:
+    HAVE_WEB = False
+
+SCALINGS = [("Default", "default"), ("Fill", "fill"), ("Fit", "fit"), ("Stretch", "stretch")]
 UR = Qt.ItemDataRole.UserRole
 THUMB_W, THUMB_H = 220, 124
 CELL = QSize(240, 184)
@@ -652,6 +836,133 @@ class SteamCmdThread(QThread):
                 self.done.emit(False, (out[-1] if out else "steamcmd produced no output"))
         except Exception as e:
             self.done.emit(False, str(e))
+
+
+class UpdateCheckThread(QThread):
+    done = pyqtSignal(bool, dict, str)
+
+    def run(self):
+        try:
+            self.done.emit(True, latest_release(), "")
+        except Exception as e:
+            self.done.emit(False, {}, str(e))
+
+
+class UpdateInstallThread(QThread):
+    done = pyqtSignal(bool, str)
+
+    def __init__(self, rel):
+        super().__init__()
+        self.rel = rel
+
+    def run(self):
+        try:
+            self.done.emit(True, install_update(self.rel))
+        except Exception as e:
+            self.done.emit(False, str(e))
+
+
+SUBSCRIBE_JS = """(function(){window.__wh=null;
+var m=document.cookie.match(/(?:^|; )sessionid=([^;]+)/);var sid=m?decodeURIComponent(m[1]):(window.g_sessionID||'');
+if(!sid){window.__wh='ERR:no Steam session found (sign in again)';return;}
+var body='id=__ID__&appid=431960&sessionid='+encodeURIComponent(sid);
+fetch('/sharedfiles/subscribe',{method:'POST',credentials:'same-origin',
+ headers:{'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8'},body:body})
+.then(function(r){return r.text().then(function(t){
+ window.__wh=(r.ok&&/"success"\\s*:\\s*(1|true)/.test(t))?'OK':'ERR:Steam answered '+r.status+' '+t.slice(0,160);});})
+.catch(function(e){window.__wh='ERR:'+e;});})();"""
+
+
+class SteamWeb(QObject):
+    """Signs in to steamcommunity.com (cookies kept in the app's own profile) and subscribes to items."""
+    login_changed = pyqtSignal(bool)
+    subscribed = pyqtSignal(str, bool, str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.logged_in = False
+        self.pages = set()
+        (DATA_DIR / "web").mkdir(parents=True, exist_ok=True)
+        self.profile = QWebEngineProfile("wallpaperhub", self)
+        self.profile.setPersistentStoragePath(str(DATA_DIR / "web"))
+        self.profile.setCachePath(str(DATA_DIR / "web" / "cache"))
+        self.profile.setPersistentCookiesPolicy(QWebEngineProfile.PersistentCookiesPolicy.ForcePersistentCookies)
+        cs = self.profile.cookieStore()
+        cs.cookieAdded.connect(self.cookie_added)
+        cs.cookieRemoved.connect(self.cookie_removed)
+        cs.loadAllCookies()
+
+    @staticmethod
+    def is_login_cookie(c):
+        return bytes(c.name()).decode(errors="ignore") == "steamLoginSecure" and "steamcommunity" in c.domain()
+
+    def cookie_added(self, c):
+        if self.is_login_cookie(c) and not self.logged_in:
+            self.logged_in = True
+            self.login_changed.emit(True)
+
+    def cookie_removed(self, c):
+        if self.is_login_cookie(c) and self.logged_in:
+            self.logged_in = False
+            self.login_changed.emit(False)
+
+    def sign_out(self):
+        self.profile.cookieStore().deleteAllCookies()
+        self.logged_in = False
+        self.login_changed.emit(False)
+
+    def subscribe(self, wid):
+        page = QWebEnginePage(self.profile, self)
+        self.pages.add(page)
+        timer = QTimer(self)
+        timer.setInterval(400)
+        state = {"n": 0, "done": False}
+
+        def finish(ok, msg):
+            if state["done"]:
+                return
+            state["done"] = True
+            timer.stop()
+            self.pages.discard(page)
+            page.deleteLater()
+            self.subscribed.emit(wid, ok, msg)
+
+        def got(r):
+            if r:
+                finish(r == "OK", "" if r == "OK" else str(r).removeprefix("ERR:"))
+
+        def poll():
+            state["n"] += 1
+            if state["n"] > 40:
+                finish(False, "Timed out talking to Steam.")
+            else:
+                page.runJavaScript("window.__wh||null", got)
+
+        def loaded(ok):
+            if not ok:
+                finish(False, "Couldn't load the Workshop page.")
+                return
+            page.runJavaScript(SUBSCRIBE_JS.replace("__ID__", wid))
+            timer.timeout.connect(poll)
+            timer.start()
+
+        page.loadFinished.connect(loaded)
+        page.load(QUrl(workshop_page_url(wid)))
+
+
+class SteamLoginDialog(QDialog):
+    def __init__(self, parent, web):
+        super().__init__(parent)
+        self.setWindowTitle("Sign in to Steam")
+        self.resize(560, 720)
+        v = QVBoxLayout(self)
+        v.addWidget(QLabel("Sign in with the Steam account that owns Wallpaper Engine. Your password goes "
+                           "straight to Steam; this app only keeps the login cookie on this computer."))
+        self.view = QWebEngineView()
+        self.view.setPage(QWebEnginePage(web.profile, self.view))
+        self.view.load(QUrl("https://steamcommunity.com/login/home/?goto=%2Fsharedfiles%2F"))
+        v.addWidget(self.view, 1)
+        web.login_changed.connect(lambda ok: self.accept() if ok else None)
 
 
 class TagButton(QPushButton):
@@ -777,6 +1088,12 @@ class Main(QMainWindow):
         self.lib_loader = self.ex_loader = None
         self.lib_sig = ()
         self.quitting = False
+        self.pending = None         # Workshop item to set as wallpaper once its download lands
+        self.latest = None          # newest GitHub release, if known
+        self.web = None
+        if HAVE_WEB:
+            self.web = SteamWeb(self)
+            self.web.subscribed.connect(self.on_subscribed)
         self.setWindowTitle("Wallpaper Hub")
         self.resize(1320, 800)
         self.build_ui()
@@ -786,6 +1103,8 @@ class Main(QMainWindow):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.tick)
         self.timer.start(3000)
+        if self.cfg["check_updates"]:
+            QTimer.singleShot(2500, self.check_updates)
         if not engine_path():
             QTimer.singleShot(400, lambda: QMessageBox.warning(
                 self, "linux-wallpaperengine missing",
@@ -810,7 +1129,23 @@ class Main(QMainWindow):
     # ---- UI ---------------------------------------------------------------
     def build_ui(self):
         split = QSplitter()
-        self.setCentralWidget(split)
+        central = QWidget()
+        cv = QVBoxLayout(central)
+        cv.setContentsMargins(0, 0, 0, 0)
+        cv.setSpacing(0)
+        self.banner = QWidget()
+        self.banner.setStyleSheet("background:#1565c0;")
+        bh = QHBoxLayout(self.banner)
+        self.banner_label = QLabel("")
+        self.banner_label.setStyleSheet("color:white;font-weight:bold;")
+        self.banner_btn = QPushButton("Update now")
+        self.banner_btn.clicked.connect(self.install_update_clicked)
+        bh.addWidget(self.banner_label, 1)
+        bh.addWidget(self.banner_btn)
+        self.banner.hide()
+        cv.addWidget(self.banner)
+        cv.addWidget(split, 1)
+        self.setCentralWidget(central)
 
         self.left = QTabWidget()
         self.left.addTab(self.page_library(), "My Library")
@@ -821,11 +1156,16 @@ class Main(QMainWindow):
         self.right = QTabWidget()
         self.right.addTab(self.tab_wallpaper(), "Wallpaper")
         self.right.addTab(self.tab_workshop_item(), "Workshop item")
-        self.right.addTab(self.tab_settings(), "Settings")
+        sa = QScrollArea()
+        sa.setWidgetResizable(True)
+        sa.setFrameShape(QScrollArea.Shape.NoFrame)
+        sa.setWidget(self.tab_settings())
+        self.right.addTab(sa, "Settings")
         self.right.addTab(self.tab_lock(), "Lock screen")
         split.addWidget(self.right)
         split.setStretchFactor(0, 1)
         split.setSizes([900, 400])
+        self.refresh_screens()
 
     def page_library(self):
         left = QWidget()
@@ -892,7 +1232,7 @@ class Main(QMainWindow):
 
         self.ex_grid = make_grid()
         self.ex_grid.currentItemChanged.connect(self.show_ex_item)
-        self.ex_grid.itemDoubleClicked.connect(lambda *_: self.subscribe())
+        self.ex_grid.itemDoubleClicked.connect(lambda *_: self.right.setCurrentIndex(1))
         v.addWidget(self.ex_grid, 1)
 
         r3 = QHBoxLayout()
@@ -929,12 +1269,8 @@ class Main(QMainWindow):
         v.addWidget(self.meta)
         v.addWidget(self.warn)
 
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Apply to:"))
-        self.target = QComboBox()
-        row.addWidget(self.target, 1)
+        row, self.target, self.scaling_box = self.apply_row()
         v.addLayout(row)
-        self.refresh_screens()
 
         b_apply = QPushButton("Apply to desktop (animated)")
         b_apply.clicked.connect(self.apply_selected)
@@ -949,6 +1285,10 @@ class Main(QMainWindow):
         self.status = QLabel("")
         self.status.setWordWrap(True)
         v.addWidget(self.status)
+        self.apply_hint = QLabel("")
+        self.apply_hint.setWordWrap(True)
+        self.apply_hint.setStyleSheet("color: #d98e04;")
+        v.addWidget(self.apply_hint)
         v.addStretch(1)
         return w
 
@@ -969,22 +1309,49 @@ class Main(QMainWindow):
         self.ex_desc.setAlignment(Qt.AlignmentFlag.AlignTop)
         for x in (self.ex_preview, self.ex_title, self.ex_meta, self.ex_desc):
             v.addWidget(x)
-        self.b_sub = QPushButton("Subscribe in Steam")
-        self.b_sub.clicked.connect(self.subscribe)
-        self.b_dl = QPushButton("Download directly (steamcmd)")
-        self.b_dl.clicked.connect(self.download_direct)
+        row, self.ex_target, self.ex_scaling = self.apply_row()
+        v.addLayout(row)
+        self.b_set = QPushButton("Set as desktop wallpaper")
+        self.b_set.clicked.connect(self.ex_set_desktop)
+        self.b_sub = QPushButton("Subscribe && download")
+        self.b_sub.clicked.connect(lambda: self.get_item())
+        self.b_steam = QPushButton("Open in Steam client")
+        self.b_steam.clicked.connect(self.open_in_steam)
         self.b_web = QPushButton("Open Workshop page in browser")
         self.b_web.clicked.connect(lambda: self.open_web())
         self.b_show = QPushButton("Show in My Library")
         self.b_show.clicked.connect(self.show_in_library)
-        for b in (self.b_sub, self.b_dl, self.b_web, self.b_show):
+        for b in (self.b_set, self.b_sub, self.b_steam, self.b_web, self.b_show):
             v.addWidget(b)
         self.ex_status = QLabel("")
         self.ex_status.setWordWrap(True)
         v.addWidget(self.ex_status)
+        self.ex_dl = QLabel("")
+        self.ex_dl.setWordWrap(True)
+        v.addWidget(self.ex_dl)
         v.addStretch(1)
-        self.update_dl_button()
         return w
+
+    def apply_row(self):
+        """'Apply to [monitor]  Scaling [mode]' controls shared by the Wallpaper and Workshop tabs."""
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Apply to:"))
+        target = QComboBox()
+        row.addWidget(target, 1)
+        row.addWidget(QLabel("Scaling:"))
+        scaling = QComboBox()
+        for label, val in SCALINGS:
+            scaling.addItem(label, val)
+        scaling.setToolTip("Default = as the wallpaper's author designed it. Fill crops to cover the monitor, "
+                           "Fit shows the whole picture, Stretch distorts to the monitor's shape.")
+        row.addWidget(scaling)
+        target.currentIndexChanged.connect(lambda *_: self.sync_scaling(target, scaling))
+        return row, target, scaling
+
+    def sync_scaling(self, target, scaling):
+        name = target.currentData()
+        mode = self.cfg["scaling"] if name in (None, "*") else self.cfg["screen_scaling"].get(name, self.cfg["scaling"])
+        scaling.setCurrentIndex(max(0, scaling.findData(mode)))
 
     def tab_settings(self):
         w = QWidget()
@@ -1003,11 +1370,19 @@ class Main(QMainWindow):
         vol.valueChanged.connect(lambda v: self.setc("volume", v))
         f.addRow("Volume", vol)
 
+        lay = QComboBox()
+        lay.addItem("Independent: a wallpaper per monitor", "independent")
+        lay.addItem("Duplicate: same wallpaper on every monitor", "duplicate")
+        lay.setCurrentIndex(max(0, lay.findData(c["layout"])))
+        lay.currentIndexChanged.connect(lambda *_: (self.setc("layout", lay.currentData()), self.apply_layout_state()))
+        f.addRow("Display layout", lay)
+
         sc = QComboBox()
-        sc.addItems(["default", "stretch", "fit", "fill"])
-        sc.setCurrentText(c["scaling"])
-        sc.currentTextChanged.connect(lambda v: self.setc("scaling", v))
-        f.addRow("Scaling", sc)
+        for label, val in SCALINGS:
+            sc.addItem(label, val)
+        sc.setCurrentIndex(max(0, sc.findData(c["scaling"])))
+        sc.currentIndexChanged.connect(lambda *_: self.setc("scaling", sc.currentData()))
+        f.addRow("Default scaling mode", sc)
 
         cl = QComboBox()
         cl.addItems(["clamp", "border", "repeat"])
@@ -1041,6 +1416,9 @@ class Main(QMainWindow):
         b = QPushButton("Restart wallpaper with these settings")
         b.clicked.connect(self.restart_clicked)
         f.addRow(b)
+        b_log = QPushButton("Show engine log && diagnostics")
+        b_log.clicked.connect(self.show_log)
+        f.addRow(b_log)
 
         f.addRow(QLabel("<b>Workshop (Explore)</b>"))
         self.api_key = QLineEdit(c["steam_api_key"])
@@ -1057,6 +1435,41 @@ class Main(QMainWindow):
         self.cmd_user.setPlaceholderText("optional – Steam username that owns Wallpaper Engine")
         self.cmd_user.editingFinished.connect(self.cmd_user_changed)
         f.addRow("steamcmd username", self.cmd_user)
+
+        f.addRow(QLabel("<b>Steam account (for Subscribe)</b>"))
+        self.acct = QLabel("")
+        self.acct.setWordWrap(True)
+        f.addRow(self.acct)
+        ab = QHBoxLayout()
+        self.b_in = QPushButton("Sign in…")
+        self.b_in.clicked.connect(lambda: SteamLoginDialog(self, self.web).exec())
+        self.b_out = QPushButton("Sign out")
+        self.b_out.clicked.connect(lambda: self.web.sign_out())
+        ab.addWidget(self.b_in)
+        ab.addWidget(self.b_out)
+        f.addRow(ab)
+        if HAVE_WEB:
+            self.web.login_changed.connect(lambda *_: self.refresh_acct())
+        self.refresh_acct()
+
+        f.addRow(QLabel("<b>Updates</b>"))
+        f.addRow(QLabel(f"Wallpaper Hub v{__version__}"))
+        auto_upd = QCheckBox("Check for updates on startup")
+        auto_upd.setChecked(bool(c["check_updates"]))
+        auto_upd.toggled.connect(lambda v: self.setc("check_updates", v))
+        f.addRow(auto_upd)
+        ub = QHBoxLayout()
+        b_chk = QPushButton("Check for updates")
+        b_chk.clicked.connect(lambda: self.check_updates(manual=True))
+        self.b_upd = QPushButton("Install update")
+        self.b_upd.setEnabled(False)
+        self.b_upd.clicked.connect(self.install_update_clicked)
+        ub.addWidget(b_chk)
+        ub.addWidget(self.b_upd)
+        f.addRow(ub)
+        self.upd_status = QLabel("")
+        self.upd_status.setWordWrap(True)
+        f.addRow(self.upd_status)
 
         self.info = QLabel("")
         self.info.setWordWrap(True)
@@ -1110,16 +1523,62 @@ class Main(QMainWindow):
         return it
 
     def refresh_screens(self):
-        self.target.clear()
-        self.target.addItem("All screens", "*")
-        for s in QApplication.screens():
-            self.target.addItem(f"{s.name()}  ({s.geometry().width()}×{s.geometry().height()})", s.name())
+        for t, sc in ((self.target, self.scaling_box), (self.ex_target, self.ex_scaling)):
+            t.clear()
+            t.addItem("All screens", "*")
+            for s in QApplication.screens():
+                t.addItem(f"{s.name()}  ({s.geometry().width()}×{s.geometry().height()})", s.name())
+            self.sync_scaling(t, sc)
+        self.apply_layout_state()
 
-    def export_png(self, it):
-        img = QImage(it["preview"]) if it["preview"] else QImage()
+    def apply_layout_state(self):
+        """'Same wallpaper on every monitor' layout: the monitor pickers are locked to All screens."""
+        dup = self.cfg["layout"] == "duplicate"
+        for t in (self.target, self.ex_target):
+            if dup:
+                t.setCurrentIndex(0)
+            t.setEnabled(not dup)
+
+    def target_screen(self):
+        """The monitor chosen in 'Apply to', or None for all monitors."""
+        name = self.target.currentData()
+        for s in QApplication.screens():
+            if s.name() == name:
+                return s
+        return None
+
+    def still_image(self, it):
+        """Best still frame available: a video frame via ffmpeg, otherwise the preview picture."""
+        f = ""
+        try:
+            f = json.loads((Path(it["dir"]) / "project.json").read_text(encoding="utf-8-sig")).get("file", "")
+        except Exception:
+            pass
+        src = Path(it["dir"]) / f if f else None
+        if it["type"] == "video" and src and src.is_file() and shutil.which("ffmpeg"):
+            out = DATA_DIR / "static" / f"{it['id']}-frame.png"
+            out.parent.mkdir(parents=True, exist_ok=True)
+            for ss in ("1", "0"):
+                if out.exists():
+                    out.unlink()
+                run(["ffmpeg", "-y", "-loglevel", "error", "-ss", ss, "-i", str(src), "-frames:v", "1", str(out)],
+                    timeout=40)
+                img = QImage(str(out)) if out.is_file() else QImage()
+                if not img.isNull():
+                    return img
+        return QImage(it["preview"]) if it["preview"] else QImage()
+
+    def export_png(self, it, screen=None):
+        """Still image scaled to cover the monitor and centre-cropped (previews are often square/small)."""
+        img = self.still_image(it)
         if img.isNull():
             return None
-        out = DATA_DIR / "static" / f"{it['id']}.png"
+        s = screen or QApplication.primaryScreen()
+        dpr = s.devicePixelRatio()
+        w, h = round(s.geometry().width() * dpr), round(s.geometry().height() * dpr)
+        img = img.scaled(w, h, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
+        img = img.copy((img.width() - w) // 2, (img.height() - h) // 2, w, h)
+        out = DATA_DIR / "static" / f"{it['id']}-{w}x{h}.png"
         out.parent.mkdir(parents=True, exist_ok=True)
         img.save(str(out), "PNG")
         return str(out)
@@ -1153,6 +1612,7 @@ class Main(QMainWindow):
         self.spawn(self.lib_loader)
         self.apply_filter()
         self.refresh_ex_marks()
+        self.check_pending()
         if not self.items:
             self.count.setText("No wallpapers found. Subscribe to some in the Explore tab, in Steam, "
                                "or use “Add folder…”.")
@@ -1278,7 +1738,7 @@ class Main(QMainWindow):
         li = self.ex_grid.currentItem()
         return self.ex_items[li.data(UR)] if li and li.data(UR) < len(self.ex_items) else None
 
-    def show_ex_item(self, *_):
+    def show_ex_item(self, *args):
         it = self.ex_current()
         if not it:
             return
@@ -1296,19 +1756,99 @@ class Main(QMainWindow):
         self.ex_desc.setText(it["desc"])
         installed = it["id"] in have
         self.b_show.setVisible(installed)
-        self.b_sub.setText("Already in your library — re-open in Steam" if installed else "Subscribe in Steam")
-        self.ex_status.setText("✓ Installed" if installed else "")
-        self.right.setCurrentIndex(1)
+        self.b_sub.setVisible(not installed)
+        self.b_set.setText("Set as desktop wallpaper" if installed else "Download && set as desktop wallpaper")
+        if installed:
+            self.ex_status.setText("✓ Installed")
+        elif self.ex_status.text() == "✓ Installed":
+            self.ex_status.setText("")
+        if args:
+            self.right.setCurrentIndex(1)
 
-    def subscribe(self):
+    def open_in_steam(self):
+        it = self.ex_current()
+        if it and not QDesktopServices.openUrl(QUrl(f"steam://url/CommunityFilePage/{it['id']}")):
+            self.open_web()
+
+    def local_item(self, wid):
+        return next((x for x in self.items if x["id"] == wid), None)
+
+    def ex_set_desktop(self):
+        """Workshop item -> desktop. Installed: apply now. Otherwise download, then apply when it arrives."""
         it = self.ex_current()
         if not it:
             return
-        if not QDesktopServices.openUrl(QUrl(f"steam://url/CommunityFilePage/{it['id']}")):
-            self.open_web()
+        local = self.local_item(it["id"])
+        if local:
+            self.apply_item(local, self.ex_target.currentData(), self.ex_scaling.currentData())
             return
-        self.ex_status.setText("Opened in Steam. Press Subscribe there; Steam downloads it and it will "
-                               "show up in My Library automatically.")
+        self.pending = {"id": it["id"], "target": self.ex_target.currentData(),
+                        "scaling": self.ex_scaling.currentData()}
+        self.ex_status.setText("Not downloaded yet. It will be set as your wallpaper as soon as it arrives.")
+        self.get_item(it)
+
+    def check_pending(self):
+        if not self.pending:
+            return
+        local = self.local_item(self.pending["id"])
+        if local:
+            p, self.pending = self.pending, None
+            self.apply_item(local, p["target"], p["scaling"])
+
+    def steamcmd_ready(self):
+        return bool(shutil.which("steamcmd") and self.cfg.get("steamcmd_user", "").strip())
+
+    def get_item(self, it=None):
+        """Subscribe to the item on Steam (so it's in your Wallpaper Engine subscriptions) and download it."""
+        it = it or self.ex_current()
+        if not it:
+            return
+        started = False
+        if HAVE_WEB:
+            if not self.web.logged_in:
+                SteamLoginDialog(self, self.web).exec()
+            if self.web.logged_in:
+                self.ex_status.setText("Subscribing on Steam…")
+                self.web.subscribe(it["id"])
+                started = True
+            else:
+                self.ex_status.setText("Not signed in to Steam, so it can't be subscribed from here.")
+        else:
+            self.ex_status.setText("Subscribing from inside the app needs `python-pyqt6-webengine` "
+                                   "(sudo pacman -S python-pyqt6-webengine).")
+        if self.steamcmd_ready():
+            self.run_steamcmd(it)
+            started = True
+        if not started:
+            self.open_in_steam()
+            self.ex_status.setText(self.ex_status.text() + "\nOpened it in the Steam client; press Subscribe there.")
+
+    def on_subscribed(self, wid, ok, msg):
+        cur = self.ex_current()
+        if ok:
+            text = ("Subscribed ✓. Steam will download it (Steam must be running) and it will appear in "
+                    "My Library automatically.")
+        else:
+            text = f"Couldn't subscribe: {msg}"
+            if not self.steamcmd_ready():
+                self.open_in_steam()
+                text += "\nOpened it in the Steam client instead; press Subscribe there."
+        if cur and cur["id"] == wid:
+            self.ex_status.setText(text)
+        else:
+            self.statusBar().showMessage(text, 8000)
+
+    def run_steamcmd(self, it):
+        exe = shutil.which("steamcmd")
+        dirs = steam_apps_dirs()
+        if not (exe and dirs):
+            self.ex_dl.setText("steamcmd or your Steam library folder wasn't found.")
+            return
+        t = SteamCmdThread(exe, self.cfg["steamcmd_user"].strip(), dirs[0].parent, it["id"])
+        t.line.connect(lambda s: self.ex_dl.setText("steamcmd: " + s))
+        t.done.connect(lambda ok, msg: (self.ex_dl.setText("steamcmd: " + msg), self.rescan() if ok else None))
+        self.ex_dl.setText("Starting steamcmd…")
+        self.spawn(t)
 
     def open_web(self):
         it = self.ex_current()
@@ -1327,47 +1867,112 @@ class Main(QMainWindow):
                 self.grid.scrollToItem(self.grid.item(i))
                 return
 
-    def update_dl_button(self):
-        exe = shutil.which("steamcmd")
-        user = self.cfg.get("steamcmd_user", "").strip()
-        self.b_dl.setEnabled(bool(exe and user))
-        self.b_dl.setToolTip("" if exe and user else
-                             "Needs steamcmd installed and a steamcmd username set in Settings "
-                             "(sign in once with `steamcmd +login <user>` in a terminal).")
+    def refresh_acct(self):
+        if not HAVE_WEB:
+            self.acct.setText("Not available: install `python-pyqt6-webengine` "
+                              "(sudo pacman -S python-pyqt6-webengine) and restart.")
+            self.b_in.setEnabled(False)
+            self.b_out.setEnabled(False)
+            return
+        on = self.web.logged_in
+        self.acct.setText("Signed in to Steam ✓" if on else "Not signed in.")
+        self.b_in.setEnabled(not on)
+        self.b_out.setEnabled(on)
+
+    # ---- updates ----------------------------------------------------------
+    def check_updates(self, manual=False):
+        if manual:
+            self.upd_status.setText("Checking…")
+        t = UpdateCheckThread()
+        t.done.connect(lambda ok, rel, err: self.on_update_checked(ok, rel, err, manual))
+        self.spawn(t)
+
+    def on_update_checked(self, ok, rel, err, manual):
+        if not ok:
+            if manual:
+                self.upd_status.setText(f"Couldn't check for updates: {err}")
+            return
+        self.latest = rel
+        if parse_version(rel["version"]) > parse_version(__version__):
+            msg = f"Wallpaper Hub {rel['version']} is available (you have {__version__})."
+            self.banner_label.setText(msg)
+            self.banner.show()
+            self.b_upd.setEnabled(True)
+            self.upd_status.setText(msg + ("\n\n" + rel["notes"][:600] if rel["notes"] else ""))
+        elif manual:
+            self.upd_status.setText(f"You're up to date (v{__version__}).")
+
+    def install_update_clicked(self):
+        if not self.latest:
+            return
+        why = update_blocker()
+        if why:
+            QMessageBox.information(self, "Update", why)
+            return
+        self.banner_btn.setEnabled(False)
+        self.b_upd.setEnabled(False)
+        self.upd_status.setText("Downloading and verifying the update…")
+        t = UpdateInstallThread(self.latest)
+        t.done.connect(self.on_update_installed)
+        self.spawn(t)
+
+    def on_update_installed(self, ok, msg):
+        self.banner_btn.setEnabled(True)
+        if not ok:
+            self.b_upd.setEnabled(True)
+            self.upd_status.setText(f"Update failed: {msg}")
+            QMessageBox.warning(self, "Update failed", msg)
+            return
+        self.banner.hide()
+        self.upd_status.setText(f"Updated to v{msg}. Restart to use it.")
+        if QMessageBox.question(self, "Updated", f"Wallpaper Hub v{msg} is installed. Restart now?") == \
+                QMessageBox.StandardButton.Yes:
+            self.restart_app()
+
+    def restart_app(self):
+        self.quitting = True
+        os.execv(sys.executable, [sys.executable, str(SCRIPT), *sys.argv[1:]])
 
     def cmd_user_changed(self):
         self.setc("steamcmd_user", self.cmd_user.text().strip())
-        self.update_dl_button()
-
-    def download_direct(self):
-        it = self.ex_current()
-        exe = shutil.which("steamcmd")
-        dirs = steam_apps_dirs()
-        if not (it and exe and dirs):
-            self.ex_status.setText("steamcmd or your Steam library folder wasn't found.")
-            return
-        t = SteamCmdThread(exe, self.cfg["steamcmd_user"].strip(), dirs[0].parent, it["id"])
-        t.line.connect(lambda s: self.ex_status.setText(s))
-        t.done.connect(lambda ok, msg: (self.ex_status.setText(msg), self.rescan() if ok else None))
-        self.b_dl.setEnabled(False)
-        t.finished.connect(self.update_dl_button)
-        self.ex_status.setText("Starting steamcmd…")
-        self.spawn(t)
 
     # ---- actions ----------------------------------------------------------
     def apply_selected(self):
         it = self.need_item()
-        if not it:
-            return
-        target = self.target.currentData()
+        if it:
+            self.apply_item(it, self.target.currentData(), self.scaling_box.currentData())
+
+    def apply_item(self, it, target, scaling):
+        """Run `it` (a library entry) on one monitor or all of them, with the chosen scaling mode."""
         names = [s.name() for s in QApplication.screens()]
+        if self.cfg["layout"] == "duplicate":
+            target = "*"
         self.cfg["assignments"] = {k: v for k, v in self.cfg["assignments"].items() if k in names}
         for n in (names if target == "*" else [target]):
             self.cfg["assignments"][n] = it["dir"]
+            self.cfg["screen_scaling"][n] = scaling
         save_cfg(self.cfg)
         ok, msg = start_engine(self.cfg)
-        self.report(ok, msg, f"Applied “{it['title']}”")
+        self.report(ok, msg, f"Applied “{it['title']}” to "
+                             f"{'all screens' if target == '*' else target}")
+        self.apply_hint.setText(session_hint() if ok else "")
         self.refresh_status()
+
+    def show_log(self):
+        from PyQt6.QtGui import QFontDatabase
+        from PyQt6.QtWidgets import QPlainTextEdit
+        d = QDialog(self)
+        d.setWindowTitle("Engine log & diagnostics")
+        d.resize(780, 520)
+        v = QVBoxLayout(d)
+        t = QPlainTextEdit(diagnostics())
+        t.setReadOnly(True)
+        t.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
+        v.addWidget(t)
+        b = QPushButton("Copy to clipboard")
+        b.clicked.connect(lambda: QApplication.clipboard().setText(t.toPlainText()))
+        v.addWidget(b)
+        d.exec()
 
     def restart_clicked(self):
         ok, msg = start_engine(self.cfg)
@@ -1382,21 +1987,24 @@ class Main(QMainWindow):
         it = self.need_item()
         if not it:
             return
-        png = self.export_png(it)
+        scr = self.target_screen()
+        png = self.export_png(it, scr)
         if not png:
             return QMessageBox.warning(self, "Wallpaper Hub", "This wallpaper has no usable preview image.")
-        ok, msg = set_static_desktop(png)
-        self.report(ok, msg, "Static desktop image set (stop the animated wallpaper to see it)")
+        g = scr.geometry() if scr else None
+        ok, msg = set_static_desktop(png, (g.x(), g.y(), g.width(), g.height()) if g else None)
+        self.report(ok, msg, f"Static desktop image set on {scr.name() if scr else 'all screens'} "
+                             "(stop the animated wallpaper to see it)")
 
     def lock_selected(self):
         it = self.need_item()
         if not it:
             return
-        png = self.export_png(it)
+        png = self.export_png(it, self.target_screen())
         if not png:
             return QMessageBox.warning(self, "Wallpaper Hub", "This wallpaper has no usable preview image.")
         ok, msg = set_lockscreen(png)
-        self.report(ok, msg, "Lock screen image set")
+        self.report(ok, msg, "Lock screen image set (the lock screen uses one image for every monitor)")
 
     def lock_file(self):
         f, _ = QFileDialog.getOpenFileName(self, "Lock screen image", str(Path.home()),

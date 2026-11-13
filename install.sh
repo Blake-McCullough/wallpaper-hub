@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
-# Wallpaper Hub installer for CachyOS / Arch
+# Wallpaper Hub installer for CachyOS / Arch.
+# Works from a git checkout, or on its own:
+#   curl -fsSL https://github.com/Blake-McCullough/wallpaper-hub/releases/latest/download/install.sh | bash
 set -e
-DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO="Blake-McCullough/wallpaper-hub"
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || echo .)"
 
 echo "==> Installing Qt bindings"
-sudo pacman -S --needed --noconfirm python-pyqt6
+sudo pacman -S --needed --noconfirm python-pyqt6 python-pyqt6-webengine
 
 if ! command -v linux-wallpaperengine >/dev/null 2>&1; then
   echo "==> Installing linux-wallpaperengine (renderer)"
@@ -18,7 +21,16 @@ if ! command -v linux-wallpaperengine >/dev/null 2>&1; then
 fi
 
 echo "==> Installing app"
-install -Dm755 "$DIR/wallpaper-hub.py" "$HOME/.local/bin/wallpaper-hub"
+if [ -f "$DIR/wallpaper-hub.py" ]; then
+  install -Dm755 "$DIR/wallpaper-hub.py" "$HOME/.local/bin/wallpaper-hub"
+else
+  echo "    downloading the latest release"
+  mkdir -p "$HOME/.local/bin"
+  curl -fsSL "https://github.com/$REPO/releases/latest/download/wallpaper-hub.py" -o "$HOME/.local/bin/wallpaper-hub.tmp"
+  install -m755 "$HOME/.local/bin/wallpaper-hub.tmp" "$HOME/.local/bin/wallpaper-hub"
+  rm -f "$HOME/.local/bin/wallpaper-hub.tmp"
+fi
+
 mkdir -p "$HOME/.local/share/applications"
 cat > "$HOME/.local/share/applications/wallpaper-hub.desktop" <<EOF
 [Desktop Entry]
@@ -32,3 +44,4 @@ Terminal=false
 EOF
 
 echo "Done. Launch 'Wallpaper Hub' from your app menu, or run: wallpaper-hub"
+echo "Future updates: Settings -> Updates inside the app."

@@ -1,0 +1,39 @@
+name: release
+
+# Bump __version__ in wallpaper-hub.py and push to main: a GitHub release (v<version>) is published
+# automatically with the app, its checksum and the installer attached. The in-app updater uses it.
+on:
+  push:
+    branches: [main]
+    paths: [wallpaper-hub.py, install.sh]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read version
+        id: v
+        run: echo "version=$(grep -m1 -oP '^__version__ = "\K[^"]+' wallpaper-hub.py)" >> "$GITHUB_OUTPUT"
+      - name: Skip if this version is already released
+        id: exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "v${{ steps.v.outputs.version }}" >/dev/null 2>&1; then echo "skip=true" >> "$GITHUB_OUTPUT"; fi
+      - name: Check
+        if: steps.exists.outputs.skip != 'true'
+        run: |
+          python3 -m py_compile wallpaper-hub.py
+          bash -n install.sh
+          sha256sum wallpaper-hub.py > wallpaper-hub.py.sha256
+      - name: Publish release
+        if: steps.exists.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v${{ steps.v.outputs.version }}" wallpaper-hub.py wallpaper-hub.py.sha256 install.sh \
+            --title "Wallpaper Hub ${{ steps.v.outputs.version }}" --generate-notes
