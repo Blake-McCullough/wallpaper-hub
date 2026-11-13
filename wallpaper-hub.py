@@ -35,7 +35,7 @@ CFG_FILE = CFG_DIR / "config.json"
 PID_FILE = DATA_DIR / "engine.pid"
 LOG_FILE = DATA_DIR / "engine.log"
 AUTOSTART = Path.home() / ".config/autostart/wallpaper-hub.desktop"
-__version__ = "1.3.3"
+__version__ = "1.3.4"
 PLUGIN_ID = "com.github.catsout.wallpaperEngineKde"   # Wallpaper Engine for KDE (Plasma wallpaper plugin)
 REPO = "Blake-McCullough/wallpaper-hub"
 SCRIPT = Path(os.path.realpath(__file__))
@@ -208,21 +208,42 @@ def scan(paths):
 
 
 # ---- Workshop (online) -------------------------------------------------------
-def http_get(url, timeout=20):
+def http_get(url, timeout=20, limit=None):
     req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
+        if limit:
+            data = r.read(limit + 1)
+            if len(data) > limit:
+                raise ValueError("file too large")
+            return data
         return r.read()
 
 
-def cached_download(url):
+def cached_download(url, limit=None):
     """Download an image once; later calls read from the on-disk cache."""
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     f = CACHE_DIR / (hashlib.sha1(url.encode()).hexdigest() + ".img")
     if f.is_file() and f.stat().st_size > 0:
         return f.read_bytes()
-    data = http_get(url)
+    data = http_get(url, timeout=40 if limit else 20, limit=limit)
     f.write_bytes(data)
     return data
+
+
+_STEAM_CDN = ("steamusercontent", "akamaihd", "steamstatic")
+
+
+def thumb_url(u):
+    """Small version for the grid. Steam's default thumbnails are letterboxed squares, so ask for a plain
+    resize that keeps the picture's own shape."""
+    if any(h in u for h in _STEAM_CDN):
+        return u.split("?")[0] + "?imw=480&imh=270&ima=fit"
+    return u
+
+
+def full_url(u):
+    """The original preview (an animated GIF for animated wallpapers)."""
+    return u.split("?")[0] if any(h in u for h in _STEAM_CDN) else u
 
 
 def cache_file(url):
@@ -812,7 +833,7 @@ if __name__ == "__main__" and "--apply" in sys.argv:
 # GUI
 # ----------------------------------------------------------------------------
 from PyQt6.QtCore import QObject, Qt, QSize, QThread, QTimer, QUrl, pyqtSignal  # noqa: E402
-from PyQt6.QtGui import QColor, QDesktopServices, QIcon, QImage, QPixmap  # noqa: E402
+from PyQt6.QtGui import QColor, QDesktopServices, QIcon, QImage, QImageReader, QMovie, QPixmap  # noqa: E402
 from PyQt6.QtWidgets import (  # noqa: E402
     QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout, QGridLayout, QGroupBox,
     QHBoxLayout, QLabel, QLineEdit, QListView, QListWidget, QListWidgetItem, QMainWindow, QMenu,
@@ -898,6 +919,63 @@ class ImageLoader(QThread):
 
         with ThreadPoolExecutor(6) as ex:
             list(ex.map(work, self.jobs))
+
+
+class PreviewLabel(QLabel):
+    """Preview box that keeps the picture's own aspect ratio and plays animated GIF/WebP previews."""
+    BOX = QSize(340, 192)
+
+    def __init__(self, text=""):
+        super().__init__(text)
+        self.mv = None
+        self.setMinimumSize(self.BOX)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setStyleSheet("background: rgba(128,128,128,40); border-radius: 6px;")
+
+    def reset(self, text=""):
+        if self.mv:
+            self.mv.stop()
+            self.mv.deleteLater()
+            self.mv = None
+        self.clear()
+        self.setText(text)
+
+    def show_file(self, path):
+        self.reset("No preview")
+        if not path or not os.path.isfile(path):
+            return
+        rd = QImageReader(path)
+        size = rd.size()
+        if rd.supportsAnimation() and rd.imageCount() > 1:
+            m = QMovie(path)
+            if size.isValid():
+                size.scale(self.BOX, Qt.AspectRatioMode.KeepAspectRatio)
+                m.setScaledSize(size)
+            m.setCacheMode(QMovie.CacheMode.CacheAll)
+            self.setMovie(m)
+            m.start()
+            self.mv = m
+            return
+        pm = QPixmap(path)
+        if not pm.isNull():
+            self.setPixmap(pm.scaled(self.BOX, Qt.AspectRatioMode.KeepAspectRatio,
+                                     Qt.TransformationMode.SmoothTransformation))
+
+
+class DetailLoader(QThread):
+    """Fetches the full-size (possibly animated) preview of the selected Workshop item."""
+    ready = pyqtSignal(int, str)
+
+    def __init__(self, url, gen):
+        super().__init__()
+        self.url, self.gen = url, gen
+
+    def run(self):
+        try:
+            cached_download(self.url, limit=30 * 1024 * 1024)
+            self.ready.emit(self.gen, self.url)
+        except Exception:
+            pass        # the small thumbnail stays on screen
 
 
 class SearchThread(QThread):
@@ -1193,6 +1271,7 @@ class Main(QMainWindow):
         self.items = []
         self.ex_items = []
         self.ex_page, self.ex_total, self.ex_gen, self.lib_gen = 1, 0, 0, 0
+        self.ex_full_gen = 0
         self.ex_loaded = False
         self.threads = set()
         self.lib_loader = self.ex_loader = None
@@ -1363,10 +1442,7 @@ class Main(QMainWindow):
     def tab_wallpaper(self):
         w = QWidget()
         v = QVBoxLayout(w)
-        self.preview = QLabel("Select a wallpaper")
-        self.preview.setMinimumSize(340, 192)
-        self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview.setStyleSheet("background: rgba(128,128,128,40); border-radius: 6px;")
+        self.preview = PreviewLabel("Select a wallpaper")
         self.title = QLabel("")
         self.title.setWordWrap(True)
         self.title.setStyleSheet("font-size: 16px; font-weight: bold;")
@@ -1409,10 +1485,7 @@ class Main(QMainWindow):
     def tab_workshop_item(self):
         w = QWidget()
         v = QVBoxLayout(w)
-        self.ex_preview = QLabel("Pick a wallpaper in “Explore Workshop”")
-        self.ex_preview.setMinimumSize(340, 192)
-        self.ex_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.ex_preview.setStyleSheet("background: rgba(128,128,128,40); border-radius: 6px;")
+        self.ex_preview = PreviewLabel("Pick a wallpaper in “Explore Workshop”")
         self.ex_title = QLabel("")
         self.ex_title.setWordWrap(True)
         self.ex_title.setStyleSheet("font-size: 16px; font-weight: bold;")
@@ -1772,12 +1845,7 @@ class Main(QMainWindow):
         it = self.current()
         if not it:
             return
-        pm = QPixmap(it["preview"]) if it["preview"] else QPixmap()
-        if pm.isNull():
-            self.preview.setText("No preview")
-        else:
-            self.preview.setPixmap(pm.scaled(340, 192, Qt.AspectRatioMode.KeepAspectRatio,
-                                             Qt.TransformationMode.SmoothTransformation))
+        self.preview.show_file(it["preview"])
         self.title.setText(it["title"])
         self.plan.setText(plan_for(it, self.cfg)[1])
         self.meta.setText(f"{it['type']} · {it['id']}" + (f"\n{', '.join(it['tags'])}" if it["tags"] else ""))
@@ -1848,7 +1916,8 @@ class Main(QMainWindow):
             self.ex_label.setText(f"Page {self.ex_page} of {pages} · {total:,} wallpapers")
         self.ex_prev.setEnabled(self.ex_page > 1)
         self.ex_next.setEnabled(bool(items) and self.ex_page < pages)
-        self.ex_loader = ImageLoader([(i, it["preview_url"]) for i, it in enumerate(items)], self.ex_gen)
+        self.ex_loader = ImageLoader([(i, thumb_url(it["preview_url"]) if it["preview_url"] else "")
+                                      for i, it in enumerate(items)], self.ex_gen)
         self.ex_loader.loaded.connect(self.on_ex_thumb)
         self.spawn(self.ex_loader)
 
@@ -1872,12 +1941,8 @@ class Main(QMainWindow):
         if not it:
             return
         have = {x["id"] for x in self.items}
-        pm = QPixmap(str(cache_file(it["preview_url"]))) if it["preview_url"] else QPixmap()
-        if pm.isNull():
-            self.ex_preview.setText("Loading preview…")
-        else:
-            self.ex_preview.setPixmap(pm.scaled(340, 192, Qt.AspectRatioMode.KeepAspectRatio,
-                                                Qt.TransformationMode.SmoothTransformation))
+        if args:                    # selection changed (not just a library refresh): load its preview
+            self.show_ex_preview(it)
         self.ex_title.setText(it["title"])
         bits = [b for b in (f"by {it['author']}" if it["author"] else "",
                             f"{it['subs']:,} subscribers" if it["subs"] else "", it["id"]) if b]
@@ -1893,6 +1958,30 @@ class Main(QMainWindow):
             self.ex_status.setText("")
         if args:
             self.right.setCurrentIndex(1)
+
+    def show_ex_preview(self, it):
+        """Show the item's full-size preview (animated if it's a GIF); a small one meanwhile."""
+        u = it["preview_url"]
+        if not u:
+            self.ex_preview.show_file("")
+            return
+        full = cache_file(full_url(u))
+        if full.is_file() and full.stat().st_size:
+            self.ex_preview.show_file(str(full))
+            return
+        small = cache_file(thumb_url(u))
+        if small.is_file():
+            self.ex_preview.show_file(str(small))
+        else:
+            self.ex_preview.reset("Loading preview…")
+        self.ex_full_gen += 1
+        t = DetailLoader(full_url(u), self.ex_full_gen)
+        t.ready.connect(self.on_full_ready)
+        self.spawn(t)
+
+    def on_full_ready(self, gen, url):
+        if gen == self.ex_full_gen:
+            self.ex_preview.show_file(str(cache_file(url)))
 
     def open_in_steam(self):
         it = self.ex_current()
